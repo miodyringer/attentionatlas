@@ -1,5 +1,11 @@
 import os
+import sys
+
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"  # Required for Phase 2 plugin
+if sys.platform == "darwin":
+    os.environ.setdefault(
+        "TORCH_COMPILE_DISABLE", "1"
+    )  # Avoid C++ compile issues on macOS
 
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,12 +33,15 @@ if not model_name:
 
 # Only Mistral has Gated Access. HF_TOKEN is required. Get it on https://huggingface.co/settings/tokens
 if "mistral" in model_name.lower() and os.getenv("HF_TOKEN") is None:
-    raise ValueError("Mistral models require HF_TOKEN environment variable to be set in .env file")
+    raise ValueError(
+        "Mistral models require HF_TOKEN environment variable to be set in .env file"
+    )
 
 print(f"Loading primary model: {model_name}")
 model = LLM(
     model=model_name,
     enforce_eager=True,  # Required for CPU
+    max_model_len=4096,  # Limit context length for CPU compatibility
 )
 
 # Enable attention capture with full attention (no windowing)
@@ -40,7 +49,7 @@ enable_attention_capture(
     model,
     capture_layers=[0, 1, 2],  # First 3 layers
     attention_window=None,  # Capture full attention matrix
-    auto_clear=True
+    auto_clear=True,
 )
 
 print("Attention capture enabled for primary model (full attention)")
@@ -52,10 +61,11 @@ compare_model = None
 if compare_model_name and compare_model_name.strip():
     print(f"Loading comparison model: {compare_model_name}")
     if "mistral" in compare_model_name.lower() and os.getenv("HF_TOKEN") is None:
-        raise ValueError("Mistral models require HF_TOKEN environment variable to be set in .env file")
+        raise ValueError(
+            "Mistral models require HF_TOKEN environment variable to be set in .env file"
+        )
     compare_model = LLM(
         model=compare_model_name,
-        device="cpu",
         enforce_eager=True,
     )
 
@@ -64,7 +74,7 @@ if compare_model_name and compare_model_name.strip():
         compare_model,
         capture_layers=[0, 1, 2],
         attention_window=None,  # Full attention
-        auto_clear=True
+        auto_clear=True,
     )
     print("Attention capture enabled for comparison model")
 else:
@@ -145,7 +155,7 @@ async def generate_answer(request: GenerateRequest):
                 "document_end": context_token_count,
                 "prompt_start": context_token_count,
                 "prompt_end": context_token_count + prompt_token_count,
-                "has_template_tokens": False
+                "has_template_tokens": False,
             }
 
         # Count prompt tokens
@@ -175,7 +185,8 @@ async def generate_answer(request: GenerateRequest):
             token_boundaries["response_end"] = total_length
 
         return GenerateResponse(
-            answer=full_content + new_answer,  # Return full text like transformer_lens did
+            answer=full_content
+            + new_answer,  # Return full text like transformer_lens did
             model=model_name,
             metadata={
                 "temperature": request.temperature,
@@ -187,11 +198,12 @@ async def generate_answer(request: GenerateRequest):
                 "context_token_count": int(context_token_count),
                 "user_prompt_token_count": int(prompt_token_count),
                 "has_document_context": request.document_context is not None,
-                "token_boundaries": token_boundaries
-            }
+                "token_boundaries": token_boundaries,
+            },
         )
     except Exception as e:
         import traceback
+
         print(f"Error in generate: {e}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
@@ -239,7 +251,9 @@ async def analyze_answer(request: AnalyzeRequest):
             layer_ids = [i for i in sorted(scores.keys()) if i <= request.attn_layer]
 
         if not layer_ids:
-            raise HTTPException(status_code=400, detail="No layers available for requested layer range")
+            raise HTTPException(
+                status_code=400, detail="No layers available for requested layer range"
+            )
 
         # Stack attention patterns from available layers
         attention_patterns = []
@@ -261,10 +275,11 @@ async def analyze_answer(request: AnalyzeRequest):
             attention_pattern=attn_list,
             shape=shape,
             num_tokens=num_tokens,
-            tokens=token_strings
+            tokens=token_strings,
         )
     except Exception as e:
         import traceback
+
         print(f"Error in analyze: {e}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
@@ -274,7 +289,10 @@ async def analyze_answer(request: AnalyzeRequest):
 async def compare_analyze(request: AnalyzeRequest):
     """Analyze text using the comparison model"""
     if not compare_model:
-        raise HTTPException(status_code=400, detail="No comparison model configured. Set COMPARE_MODEL in .env file")
+        raise HTTPException(
+            status_code=400,
+            detail="No comparison model configured. Set COMPARE_MODEL in .env file",
+        )
 
     try:
         # Tokenize the text with comparison model
@@ -307,7 +325,9 @@ async def compare_analyze(request: AnalyzeRequest):
             layer_ids = [i for i in sorted(scores.keys()) if i <= request.attn_layer]
 
         if not layer_ids:
-            raise HTTPException(status_code=400, detail="No layers available for requested layer range")
+            raise HTTPException(
+                status_code=400, detail="No layers available for requested layer range"
+            )
 
         attention_patterns = []
         for layer_id in layer_ids:
@@ -325,10 +345,11 @@ async def compare_analyze(request: AnalyzeRequest):
             attention_pattern=attn_list,
             shape=shape,
             num_tokens=num_tokens,
-            tokens=token_strings
+            tokens=token_strings,
         )
     except Exception as e:
         import traceback
+
         print(f"Error in compare: {e}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
@@ -345,14 +366,14 @@ async def get_models():
     return {
         "primary_model": model_name,
         "compare_model": compare_model_name,
-        "backend": "vLLM"
+        "backend": "vLLM",
     }
 
 
 @app.post("/extract_pdf")
 async def extract_pdf(file: UploadFile):
     """Extract text from PDF file"""
-    if not file.filename.endswith('.pdf'):
+    if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files supported")
 
     try:
@@ -383,8 +404,8 @@ const API_CONFIG = {{
 }};
 """
 
-    config_path = os.path.join(os.path.dirname(__file__), 'frontend', 'js', 'config.js')
-    with open(config_path, 'w') as f:
+    config_path = os.path.join(os.path.dirname(__file__), "frontend", "js", "config.js")
+    with open(config_path, "w") as f:
         f.write(config_content)
 
     print(f"Generated frontend config at {config_path}")

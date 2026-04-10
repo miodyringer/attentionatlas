@@ -91,12 +91,16 @@ def enable_attention_capture(
 
     # Debug: Write to file FIRST to ensure it happens
     try:
-        with open('/tmp/vllm_debug.txt', 'w') as f:
+        with open("/tmp/vllm_debug.txt", "w") as f:
             f.write("=== DIAGNOSTIC: enable_attention_capture called ===\n")
             f.write(f"llm type: {type(llm)}\n")
             f.write(f"llm_engine type: {type(llm.llm_engine)}\n")
-            f.write(f"llm_engine has engine_core: {hasattr(llm.llm_engine, 'engine_core')}\n")
-            f.write(f"llm_engine has model_executor: {hasattr(llm.llm_engine, 'model_executor')}\n")
+            f.write(
+                f"llm_engine has engine_core: {hasattr(llm.llm_engine, 'engine_core')}\n"
+            )
+            f.write(
+                f"llm_engine has model_executor: {hasattr(llm.llm_engine, 'model_executor')}\n"
+            )
             f.write(f"llm_engine dir: {dir(llm.llm_engine)}\n\n")
     except Exception as e:
         logger.error(f"Failed to write debug file: {e}")
@@ -112,7 +116,7 @@ def enable_attention_capture(
     # Patch the model's attention layers
     try:
         # Debug: inspect llm.llm_engine structure - write to file
-        with open('/tmp/vllm_debug.txt', 'w') as f:
+        with open("/tmp/vllm_debug.txt", "w") as f:
             f.write("=== DIAGNOSTIC: Inspecting vLLM Engine Structure ===\n")
             f.write(f"llm_engine type: {type(llm.llm_engine)}\n")
             f.write(f"llm_engine dir: {dir(llm.llm_engine)}\n\n")
@@ -165,12 +169,18 @@ def enable_attention_capture(
                     """
                     try:
                         # Import in engine process
-                        from vllm_attention_capture_plugin.hooks.attention_hook import AttentionCaptureHook
-                        from vllm_attention_capture_plugin.wrappers.attention_layer_patcher import patch_model_for_attention_capture
+                        from vllm_attention_capture_plugin.hooks.attention_hook import (
+                            AttentionCaptureHook,
+                        )
+                        from vllm_attention_capture_plugin.wrappers.attention_layer_patcher import (
+                            patch_model_for_attention_capture,
+                        )
                         import vllm_attention_capture_plugin.api as plugin_api
 
                         # Recreate hook in engine process using closure variables
-                        engine_hook = AttentionCaptureHook(attention_window, capture_layers)
+                        engine_hook = AttentionCaptureHook(
+                            attention_window, capture_layers
+                        )
                         engine_hook.auto_clear = auto_clear
 
                         # Find model in engine process
@@ -178,19 +188,21 @@ def enable_attention_capture(
 
                         # If worker provided, try to get model from it
                         if worker is not None:
-                            if hasattr(worker, 'model_runner'):
-                                if hasattr(worker.model_runner, 'model'):
+                            if hasattr(worker, "model_runner"):
+                                if hasattr(worker.model_runner, "model"):
                                     model = worker.model_runner.model
 
                         # Fallback: search for model via gc
                         if model is None:
                             try:
-                                from vllm.v1.worker.cpu_model_runner import CPUModelRunner
+                                from vllm.v1.worker.cpu_model_runner import (
+                                    CPUModelRunner,
+                                )
                                 import gc
 
                                 for obj in gc.get_objects():
                                     if isinstance(obj, CPUModelRunner):
-                                        if hasattr(obj, 'model'):
+                                        if hasattr(obj, "model"):
                                             model = obj.model
                                             break
                             except Exception:
@@ -199,19 +211,24 @@ def enable_attention_capture(
                         # Try GPU model runner too
                         if model is None:
                             try:
-                                from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+                                from vllm.v1.worker.gpu_model_runner import (
+                                    GPUModelRunner,
+                                )
                                 import gc
 
                                 for obj in gc.get_objects():
                                     if isinstance(obj, GPUModelRunner):
-                                        if hasattr(obj, 'model'):
+                                        if hasattr(obj, "model"):
                                             model = obj.model
                                             break
                             except Exception:
                                 pass
 
                         if model is None:
-                            return {"success": False, "error": "Could not find model in engine process"}
+                            return {
+                                "success": False,
+                                "error": "Could not find model in engine process",
+                            }
 
                         # Store hook in engine process registry
                         plugin_api._CAPTURE_HOOKS[hook_llm_id] = engine_hook
@@ -223,10 +240,11 @@ def enable_attention_capture(
 
                     except Exception as e:
                         import traceback
+
                         return {
                             "success": False,
                             "error": str(e),
-                            "traceback": traceback.format_exc()
+                            "traceback": traceback.format_exc(),
                         }
 
                 # Execute via RPC
@@ -240,7 +258,9 @@ def enable_attention_capture(
                     tb = result.get("traceback", "")
                     raise RuntimeError(f"{error}\n{tb}")
 
-                logger.info(f"✅ Attention capture enabled successfully (v1 via RPC) - model: {result.get('model_type')}")
+                logger.info(
+                    f"✅ Attention capture enabled successfully (v1 via RPC) - model: {result.get('model_type')}"
+                )
                 return  # Success via v1 RPC
 
             except Exception as e:
@@ -318,7 +338,7 @@ def get_attention_scores(request_id: str) -> dict[int, Any] | None:
                 "Found captures under 'default_request' instead of '%s'. "
                 "This is a temporary workaround for Phase 2. "
                 "Consider using get_latest_attention_scores() for single-request scenarios.",
-                request_id
+                request_id,
             )
             return hook.get_captured_scores("default_request")
 
