@@ -86,238 +86,251 @@ def patch_attention_layer(
         Returns:
             Attention output tensor
         """
-        # Log EVERY forward call to layer (even if not capturing)
         num_tokens = query.shape[0]
         is_decode = (num_tokens == 1)
 
-        # === PARAMETER LOGGING FOR DEBUGGING ===
-        logger.info("=" * 80)
-        logger.info("🔍 HOOK CALLED - Layer %d forward", layer_idx)
-        logger.info("=" * 80)
-        logger.info("Phase: %s", "DECODE" if is_decode else "PREFILL")
-        logger.info("Query shape: %s, dtype: %s", query.shape, query.dtype)
-        logger.info("Key shape: %s, dtype: %s", key.shape, key.dtype)
-        logger.info("Value shape: %s, dtype: %s", value.shape, value.dtype)
-        logger.info("output_shape: %s", output_shape)
-
-        # Try to access kv_cache and attn_metadata from the Attention instance
-        logger.info("\n🔎 Attempting to access kv_cache/attn_metadata from instance:")
-
-        kv_cache = getattr(attention_layer, "kv_cache", None)
-        logger.info("  attention_layer.kv_cache: %s", type(kv_cache))
-        if isinstance(kv_cache, torch.Tensor):
-            logger.info("    shape: %s", kv_cache.shape)
-        elif isinstance(kv_cache, list) and len(kv_cache) > 0:
-            logger.info("    list with %d elements", len(kv_cache))
-            if isinstance(kv_cache[0], torch.Tensor):
-                logger.info("    first element shape: %s", kv_cache[0].shape)
-
-        # Try to get from context
-        try:
-            from vllm.model_executor.layers.attention.attention import (
-                get_attention_context,
-            )
-            layer_name = getattr(attention_layer, "layer_name", None)
-            logger.info("  attention_layer.layer_name: %s", layer_name)
-
-            if layer_name:
-                context_result = get_attention_context(layer_name)
-                logger.info("  get_attention_context returned: %s", type(context_result))
-                if context_result:
-                    logger.info("    context tuple length: %d", len(context_result) if isinstance(context_result, tuple) else 0)
-        except Exception as e:
-            logger.info("  Failed to get attention context: %s", e)
-
-        logger.info("=" * 80)
+        # Only log for layer 0
+        if layer_idx == 0:
+            phase = "DECODE" if is_decode else "PREFILL"
+            logger.info(f"\n[Layer {layer_idx}] {phase} phase: {num_tokens} token(s)")
+            logger.info(f"  Input Q: {query.shape}, K: {key.shape}, V: {value.shape}")
 
         # Check if we should capture this layer
         if not capture_hook.should_capture(layer_idx):
-            # Use vLLM's optimized backend
-            logger.info("❌ Layer %d: NOT in capture_layers, skipping", layer_idx)
             return original_forward(query, key, value, output_shape)
-
-        logger.info("✅ Layer %d: IN capture_layers - hook is active!", layer_idx)
 
         # Call vLLM's original forward first (don't modify behavior)
         result = original_forward(query, key, value, output_shape)
-        logger.info("✅ Original forward completed, result shape: %s", result.shape)
 
         # === ATTENTION COMPUTATION FOR CAPTURE ===
         try:
-            # Use attention parameters from closure (extracted during patching)
-            # num_heads, num_kv_heads, head_size, scale are already in scope
-
-            logger.info("Computing attention weights: heads=%d, kv_heads=%d, head_size=%d",
-                       num_heads, num_kv_heads, head_size)
-
             if not is_decode:
                 # ============================================================
                 # PREFILL PHASE: All tokens in prompt
                 # ============================================================
-                logger.info("🧮 PREFILL: Computing attention for %d tokens", num_tokens)
+                # Save RAW K before any processing
+                raw_k_input = key.clone()
 
                 # Reshape Q, K, V: [num_tokens, num_heads * head_size] -> [num_tokens, num_heads, head_size]
                 q = query.view(num_tokens, num_heads, head_size)
                 k = key.view(num_tokens, num_kv_heads, head_size)
                 v = value.view(num_tokens, num_kv_heads, head_size)
 
-                logger.info("  Q: %s, K: %s, V: %s", q.shape, k.shape, v.shape)
+                if layer_idx == 0:
+                    logger.info(f"  Reshaped Q: {q.shape}, K: {k.shape}")
+                    logger.info(f"  PREFILL Q[0,0,:5] = {q[0, 0, :5].float().cpu().numpy()}")
+                    logger.info(f"  PREFILL K[0,0,:5] (raw from input) = {k[0, 0, :5].float().cpu().numpy()}")
+                    logger.info(f"  PREFILL K[-1,0,:5] (raw from input) = {k[-1, 0, :5].float().cpu().numpy()}")
+
+                    # Save raw K for comparison with cache later
+                    try:
+                        import pickle
+                        with open('/tmp/vllm_prefill_k_raw.pkl', 'wb') as f:
+                            pickle.dump(k.float().detach().cpu(), f)
+                    except: pass
 
                 # Handle GQA: repeat KV heads to match Q heads
                 if num_kv_heads < num_heads:
                     num_queries_per_kv = num_heads // num_kv_heads
                     k = k.repeat_interleave(num_queries_per_kv, dim=1)
                     v = v.repeat_interleave(num_queries_per_kv, dim=1)
-                    logger.info("  GQA: Repeated K/V to %s", k.shape)
 
                 # Transpose for attention computation
-                # Q: [num_tokens, num_heads, head_size]
-                # K: [num_tokens, num_heads, head_size] -> [num_heads, head_size, num_tokens]
                 k_t = k.transpose(0, 1).transpose(1, 2)  # [num_heads, head_size, num_tokens]
                 q_transposed = q.transpose(0, 1)  # [num_heads, num_tokens, head_size]
 
                 # Compute attention scores: Q @ K^T * scale
-                # [num_heads, num_tokens, head_size] @ [num_heads, head_size, num_tokens]
-                # = [num_heads, num_tokens, num_tokens]
                 scores = torch.bmm(q_transposed, k_t) * scale
-                logger.info("  Scores: %s", scores.shape)
 
-                # Apply causal mask: token i can only attend to tokens [0, i]
-                # Create mask where position (i, j) is True if j > i (future positions)
+                # Apply causal mask
                 causal_mask = torch.triu(torch.ones(num_tokens, num_tokens, device=scores.device), diagonal=1).bool()
-                # Set future positions to -inf so softmax gives them 0 probability
                 scores = scores.masked_fill(causal_mask.unsqueeze(0), float('-inf'))
-                logger.info("  Applied causal mask")
 
                 # Apply softmax to get attention weights
                 attn_weights = torch.softmax(scores, dim=-1)
-                logger.info("  Attention weights: %s, range=[%.4f, %.4f]",
-                           attn_weights.shape, attn_weights.min().item(), attn_weights.max().item())
+
+                if layer_idx == 0:
+                    logger.info(f"  Scores: {scores.shape}, range=[{scores[0].min().item():.3f}, {scores[0].max().item():.3f}]")
+                    logger.info(f"  Attention: {attn_weights.shape}, sum={attn_weights[0, 0].sum().item():.3f}")
+
+                    # IMPORTANT: Check what's in cache AFTER original_forward() in prefill
+                    # This will show us the transformation vLLM applies
+                    try:
+                        from vllm.model_executor.layers.attention.attention import get_attention_context
+                        layer_name = getattr(attention_layer, "layer_name", None)
+                        if layer_name:
+                            attn_metadata, _, kv_cache, _ = get_attention_context(layer_name)
+                            if kv_cache is not None and attn_metadata is not None:
+                                seq_len = attn_metadata.seq_lens[0].item()
+                                block_table = attn_metadata.block_table[0]
+                                block_size = kv_cache.shape[3]
+
+                                # Extract first token from cache to compare with raw input
+                                block_idx = block_table[0].item()
+                                first_token_k_cached = kv_cache[0, block_idx, :, 0, :]  # [num_kv_heads, head_size]
+
+                                logger.info(f"\n  PREFILL CACHE CHECK:")
+                                logger.info(f"  Cache shape: {kv_cache.shape}")
+                                logger.info(f"  Extracting: kv_cache[0, block_idx={block_idx}, head=0, token=0, :]")
+
+                                # Extract first token from cache
+                                block_idx = block_table[0].item()
+                                first_token_k_cached = kv_cache[0, block_idx, 0, 0, :]  # [head_size]
+
+                                # Also check second token to see pattern
+                                second_token_k_cached = kv_cache[0, block_idx, 0, 1, :]  # [head_size]
+
+                                logger.info(f"  Token 0 K from cache (full): {first_token_k_cached.float().cpu().numpy()}")
+                                logger.info(f"  Token 0 K from raw (full):   {k[0, 0, :].float().cpu().numpy()}")
+                                logger.info(f"  Token 1 K from cache (full): {second_token_k_cached.float().cpu().numpy()}")
+                                logger.info(f"  Token 1 K from raw (full):   {k[1, 0, :].float().cpu().numpy()}")
+
+                                # Check if the pattern is consistent
+                                diff0 = (first_token_k_cached - k[0, 0, :]).float().cpu().numpy()
+                                diff1 = (second_token_k_cached - k[1, 0, :]).float().cpu().numpy()
+
+                                cache0_np = first_token_k_cached.float().cpu().numpy()
+                                cache1_np = second_token_k_cached.float().cpu().numpy()
+
+                                logger.info(f"  Token 0: zeros in cache: {(abs(cache0_np) < 1e-6).sum()}/{len(cache0_np)}, max diff: {abs(diff0).max():.6f}")
+                                logger.info(f"  Token 1: zeros in cache: {(abs(cache1_np) < 1e-6).sum()}/{len(cache1_np)}, max diff: {abs(diff1).max():.6f}")
+
+                                # Check which dimensions are zero
+                                zero_dims_0 = np.where(abs(cache0_np) < 1e-6)[0]
+                                zero_dims_1 = np.where(abs(cache1_np) < 1e-6)[0]
+                                logger.info(f"  Token 0 zero dimensions: {zero_dims_0}")
+                                logger.info(f"  Token 1 zero dimensions: {zero_dims_1}")
+                                logger.info(f"  Zero dims match: {np.array_equal(zero_dims_0, zero_dims_1)}")
+
+                                # Save both for detailed analysis
+                                import pickle
+                                with open('/tmp/vllm_prefill_k_cached.pkl', 'wb') as f:
+                                    pickle.dump(first_token_k_cached.float().detach().cpu(), f)
+                                with open('/tmp/vllm_prefill_k_raw_comparison.pkl', 'wb') as f:
+                                    pickle.dump({'cached': first_token_k_cached.float().detach().cpu(),
+                                               'raw': k[0, 0, :].float().detach().cpu(),
+                                               'diff': diff0}, f)
+                    except Exception as e:
+                        logger.info(f"  Failed to check cache: {e}")
 
             else:
                 # ============================================================
                 # DECODE PHASE: One new token, attend to all previous + self
                 # ============================================================
-                logger.info("🧮 DECODE: Computing attention for new token")
+                # Reshape new token's Q from input parameter (Q is not cached)
+                new_q = query.view(1, num_heads, head_size)
 
-                # Get context to access KV cache and metadata
+                # Get context to access KV cache
                 from vllm.model_executor.layers.attention.attention import (
                     get_attention_context,
                 )
                 layer_name = getattr(attention_layer, "layer_name", None)
-                if not layer_name:
-                    logger.warning("No layer_name, cannot get context for DECODE")
-                    logger.info("=" * 80)
+
+                if not layer_name or get_attention_context(layer_name)[0] is None:
                     return result
 
                 attn_metadata, _, kv_cache, _ = get_attention_context(layer_name)
-                if attn_metadata is None:
-                    logger.warning("No attn_metadata available")
-                    logger.info("=" * 80)
-                    return result
 
                 # Get sequence info
                 seq_len = attn_metadata.seq_lens[0].item()
                 block_table = attn_metadata.block_table[0]
-                block_size = kv_cache.shape[3]  # [2, num_blocks, num_heads, block_size, head_dim]
+                block_size = kv_cache.shape[3]
 
-                logger.info("  seq_len=%d, block_size=%d, block_table=%s",
-                           seq_len, block_size, block_table.tolist())
+                if layer_idx == 0:
+                    logger.info(f"  seq_len={seq_len} (total tokens including new one)")
+                    logger.info(f"  New Q: {new_q.shape}")
+                    logger.info(f"  DECODE Q[0,0,:5] = {new_q[0, 0, :5].float().cpu().numpy()}")
 
-                # Reshape new token's Q, K, V
-                new_q = query.view(1, num_heads, head_size)
-                new_k = key.view(1, num_kv_heads, head_size)
-                new_v = value.view(1, num_kv_heads, head_size)
+                # === SAVE Q FOR COMPARISON ===
+                try:
+                    import pickle
+                    q_to_save = new_q.float() if new_q.dtype == torch.bfloat16 else new_q
+                    with open('/tmp/vllm_debug_q.pkl', 'wb') as f:
+                        pickle.dump(q_to_save.detach().cpu(), f)
+                except: pass
 
-                # Extract past keys and values from KV cache
-                num_past_tokens = seq_len - 1
+                # Extract ALL keys from KV cache (including the transformed new key)
+                # The cache has been updated by original_forward(), so it contains all seq_len tokens
+                num_blocks_needed = (seq_len + block_size - 1) // block_size
+                all_keys_list = []
+                tokens_remaining = seq_len
 
-                if num_past_tokens == 0:
-                    # First token - no past context, just use new K
-                    logger.info("  First token, no past keys to extract")
-                    # Handle GQA
-                    if num_kv_heads < num_heads:
-                        num_queries_per_kv = num_heads // num_kv_heads
-                        new_k_repeated = new_k.repeat_interleave(num_queries_per_kv, dim=1)
-                    else:
-                        new_k_repeated = new_k
-                    all_keys = new_k_repeated.squeeze(0).unsqueeze(1)  # [num_heads, 1, head_size]
-                else:
-                    num_blocks_needed = (num_past_tokens + block_size - 1) // block_size
+                for i in range(num_blocks_needed):
+                    block_idx = block_table[i].item()
+                    tokens_in_this_block = min(tokens_remaining, block_size)
+                    block_keys = kv_cache[0, block_idx, :, :tokens_in_this_block, :]
+                    all_keys_list.append(block_keys)
+                    tokens_remaining -= tokens_in_this_block
 
-                    logger.info("  Extracting %d past tokens from %d blocks",
-                               num_past_tokens, num_blocks_needed)
+                # Concatenate: [num_kv_heads, seq_len, head_size]
+                all_keys = torch.cat(all_keys_list, dim=1)
 
-                    # Extract keys from cache
-                    past_keys_list = []
-                    tokens_remaining = num_past_tokens
-                    for i in range(num_blocks_needed):
-                        block_idx = block_table[i].item()
-                        tokens_in_this_block = min(tokens_remaining, block_size)
+                # Handle GQA
+                if num_kv_heads < num_heads:
+                    num_queries_per_kv = num_heads // num_kv_heads
+                    all_keys = all_keys.repeat_interleave(num_queries_per_kv, dim=0)
 
-                        # kv_cache[0] = keys, shape: [num_blocks, num_kv_heads, block_size, head_size]
-                        block_keys = kv_cache[0, block_idx, :, :tokens_in_this_block, :]
-                        past_keys_list.append(block_keys)
-                        tokens_remaining -= tokens_in_this_block
+                # All keys are now consistently transformed (by vLLM)
 
-                    # Concatenate along token dimension: [num_kv_heads, num_past_tokens, head_size]
-                    past_keys = torch.cat(past_keys_list, dim=1)
-                    logger.info("  Extracted past keys: %s", past_keys.shape)
+                # === SAVE K FOR COMPARISON ===
+                try:
+                    import pickle
+                    k_to_save = all_keys.float() if all_keys.dtype == torch.bfloat16 else all_keys
+                    with open('/tmp/vllm_debug_k.pkl', 'wb') as f:
+                        pickle.dump(k_to_save.detach().cpu(), f)
+                except: pass
 
-                    # Handle GQA: repeat KV heads to match Q heads
-                    if num_kv_heads < num_heads:
-                        num_queries_per_kv = num_heads // num_kv_heads
-                        past_keys = past_keys.repeat_interleave(num_queries_per_kv, dim=0)
-                        new_k_repeated = new_k.repeat_interleave(num_queries_per_kv, dim=1)
-                        logger.info("  GQA: Repeated to %s", past_keys.shape)
-                    else:
-                        new_k_repeated = new_k
+                if layer_idx == 0:
+                    logger.info(f"  All K: {all_keys.shape}")
+                    logger.info(f"  DECODE K[0,0,:5] (1st token) = {all_keys[0, 0, :5].float().cpu().numpy()}")
+                    logger.info(f"  DECODE K[0,-1,:5] (new token from input) = {all_keys[0, -1, :5].float().cpu().numpy()}")
 
-                    # Concatenate past + new keys: [num_heads, seq_len, head_size]
-                    # past_keys: [num_heads, num_past_tokens, head_size]
-                    # new_k_repeated: [1, num_heads, head_size] -> squeeze(0).unsqueeze(1) -> [num_heads, 1, head_size]
-                    new_k_reshaped = new_k_repeated.squeeze(0).unsqueeze(1)  # [num_heads, 1, head_size]
-                    all_keys = torch.cat([past_keys, new_k_reshaped], dim=1)
-                    logger.info("  All keys (past + new): %s", all_keys.shape)
+                    # Check for zero dimensions
+                    first_token_k = all_keys[0, 0, :].float().cpu().numpy()
+                    zero_dims = np.where(np.abs(first_token_k) < 1e-6)[0]
+                    logger.info(f"  First token K zero dimensions: {len(zero_dims)}/{len(first_token_k)} (should be few/none)")
+                    if len(zero_dims) > 0:
+                        logger.info(f"    Zero dim indices: {zero_dims}")
 
                 # Compute attention: new query @ all keys
-                # new_q: [1, num_heads, head_size]
-                # all_keys: [num_heads, seq_len, head_size] -> transpose -> [num_heads, head_size, seq_len]
                 all_keys_t = all_keys.transpose(1, 2)  # [num_heads, head_size, seq_len]
                 new_q_squeezed = new_q.squeeze(0)  # [num_heads, head_size]
 
-                # [num_heads, 1, head_size] @ [num_heads, head_size, seq_len] = [num_heads, 1, seq_len]
                 scores = torch.bmm(new_q_squeezed.unsqueeze(1), all_keys_t).squeeze(1) * scale
-                logger.info("  Scores: %s", scores.shape)
 
-                # Apply softmax: [num_heads, seq_len]
+                # Apply softmax
                 attn_weights = torch.softmax(scores, dim=-1)
-                logger.info("  Attention weights: %s, range=[%.4f, %.4f]",
-                           attn_weights.shape, attn_weights.min().item(), attn_weights.max().item())
+
+                if layer_idx == 0:
+                    logger.info(f"  Scores: {scores.shape}, range=[{scores[0].min().item():.3f}, {scores[0].max().item():.3f}]")
+                    logger.info(f"  Attention: {attn_weights.shape}, sum={attn_weights[0].sum().item():.3f}")
+
+                # === SAVE SCORES AND ATTENTION FOR COMPARISON ===
+                try:
+                    import pickle
+                    scores_to_save = scores.float() if scores.dtype == torch.bfloat16 else scores
+                    attn_to_save = attn_weights.float() if attn_weights.dtype == torch.bfloat16 else attn_weights
+                    with open('/tmp/vllm_debug_scores.pkl', 'wb') as f:
+                        pickle.dump(scores_to_save.detach().cpu(), f)
+                    with open('/tmp/vllm_debug_attn.pkl', 'wb') as f:
+                        pickle.dump(attn_to_save.detach().cpu(), f)
+                except: pass
 
                 # Reshape to [num_heads, 1, seq_len] for consistency with PREFILL format
-                # PREFILL: [num_heads, num_tokens, seq_len]
-                # DECODE: [num_heads, 1, seq_len] where num_tokens=1
                 attn_weights = attn_weights.unsqueeze(1)
 
             # Store attention weights via capture hook
-            request_id = "default_request"  # TODO: Extract from attn_metadata
+            request_id = "default_request"
             capture_hook.capture_attention_weights(
                 layer_idx=layer_idx,
                 attn_weights=attn_weights,
                 request_id=request_id,
             )
-            logger.info("✅ Stored attention weights for layer %d", layer_idx)
 
         except Exception as e:
-            logger.error("❌ Failed to compute attention weights: %s", e)
-            import traceback
-            traceback_str = traceback.format_exc()
-            logger.debug("Traceback: %s", traceback_str)
-            # Log first 500 chars of traceback to INFO for debugging
-            logger.info("Error details: %s", traceback_str[:500])
+            if layer_idx == 0:
+                logger.error(f"  ❌ Failed to compute attention: {e}")
 
-        logger.info("=" * 80)
         return result
 
     # Replace forward method

@@ -82,6 +82,10 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
+# Store attention weights from generation
+# Format: {full_text: {"scores": attention_dict, "tokens": token_list}}
+attention_cache = {}
+
 
 class GenerateRequest(BaseModel):
     prompt: str
@@ -169,6 +173,25 @@ async def generate_answer(request: GenerateRequest):
         actual_new_tokens = len(output.outputs[0].token_ids)
         total_length = prompt_length + actual_new_tokens
 
+        # CAPTURE ATTENTION WEIGHTS DURING GENERATION
+        # Get the attention scores that were just captured
+        attention_scores = get_latest_attention_scores()
+
+        # Tokenize the full text to get token strings
+        tokenizer = model.get_tokenizer()
+        full_text_for_cache = full_content + new_answer
+        token_ids = tokenizer.encode(full_text_for_cache)
+        token_strings = [tokenizer.decode([tid]) for tid in token_ids]
+
+        # Store in cache with the full text as key
+        attention_cache[full_text_for_cache] = {
+            "scores": attention_scores,
+            "tokens": token_strings,
+            "num_tokens": len(token_strings)
+        }
+
+        print(f"✅ Cached attention weights for {len(token_strings)} tokens")
+
         # Complete token boundaries with response positions
         if token_boundaries is not None:
             token_boundaries["response_start"] = prompt_length
@@ -199,36 +222,27 @@ async def generate_answer(request: GenerateRequest):
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze_answer(request: AnalyzeRequest):
+    """
+    Analyze attention weights that were captured during generation.
+    No need to run through the model again - just retrieve from cache.
+    """
     try:
-        # Tokenize the text with vLLM
-        tokenizer = model.get_tokenizer()
-        token_ids = tokenizer.encode(request.answer)
-        num_tokens = len(token_ids)
+        text = request.answer
 
-        # Decode individual tokens
-        token_strings = [tokenizer.decode([tid]) for tid in token_ids]
+        # Check if we have cached attention for this text
+        if text not in attention_cache:
+            raise HTTPException(
+                status_code=400,
+                detail="No attention weights found for this text. Please generate the text first."
+            )
 
-        # Generate with attention capture enabled to get attention patterns
-        # We need to run through the model to capture attention
-        sampling_params = SamplingParams(
-            temperature=0.0,
-            max_tokens=1,  # Just need one token to trigger attention capture
-            skip_special_tokens=True,
-        )
-
-        # Run generation (this will populate attention cache)
-        _ = model.generate([request.answer], sampling_params)
-
-        # Get captured attention scores
-        scores = get_latest_attention_scores()
+        cached_data = attention_cache[text]
+        scores = cached_data["scores"]
+        token_strings = cached_data["tokens"]
+        num_tokens = cached_data["num_tokens"]
 
         if scores is None:
-            raise HTTPException(status_code=500, detail="No attention scores captured")
-
-        # Convert from plugin format to transformer_lens format
-        # Plugin now returns full attention when attention_window=None
-        # Plugin format: {layer_id: np.ndarray of shape [num_heads, num_tokens_generated, seq_len]}
-        # TransformerLens format: [num_layers, num_heads, seq_len, seq_len]
+            raise HTTPException(status_code=500, detail="No attention scores in cache")
 
         # Determine which layers to return based on request
         if request.attn_layer == -1:
@@ -245,9 +259,6 @@ async def analyze_answer(request: AnalyzeRequest):
         attention_patterns = []
         for layer_id in layer_ids:
             layer_attn = scores[layer_id]  # [num_heads, num_tokens, seq_len]
-
-            # The plugin now returns full attention matrix
-            # Just use it directly
             attention_patterns.append(layer_attn)
 
         # Stack into tensor-like structure: [num_layers, num_heads, seq_len, seq_len]
@@ -257,12 +268,16 @@ async def analyze_answer(request: AnalyzeRequest):
         attn_list = attn.tolist()
         shape = list(attn.shape)
 
+        print(f"✅ Retrieved attention from cache: shape {shape}, {num_tokens} tokens")
+
         return AnalyzeResponse(
             attention_pattern=attn_list,
             shape=shape,
             num_tokens=num_tokens,
             tokens=token_strings
         )
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         print(f"Error in analyze: {e}")

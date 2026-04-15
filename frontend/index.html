@@ -85,10 +85,14 @@
                 <h2>Attention Analysis</h2>
                 <div class="error" id="visualize-error"></div>
 
+                <!-- Text Display (read-only) -->
                 <div class="form-group">
-                    <label for="analyze-text">Text to Analyze</label>
-                    <div id="analyze-text-structured" style="display: none;"></div>
-                    <textarea id="analyze-text" placeholder="Enter text to analyze or use generated text from the Generate tab..."></textarea>
+                    <label>Generated Text to Analyze</label>
+                    <div id="analyze-text-structured"></div>
+                    <textarea id="analyze-text" readonly style="display: none;"></textarea>
+                    <p class="info-text" id="no-text-message" style="color: #666; font-style: italic;">
+                        Generate text in the Generate tab first, then click "Use in Visualization Tab"
+                    </p>
                 </div>
 
                 <div class="form-group">
@@ -96,7 +100,7 @@
                     <input type="number" id="attn-layer" value="0" min="-1" step="1">
                 </div>
 
-                <button class="button" onclick="analyzeText()">Analyze</button>
+                <button class="button" onclick="analyzeText()" id="analyze-button" disabled>Analyze</button>
             </div>
 
             <div class="loading" id="analyze-loading">

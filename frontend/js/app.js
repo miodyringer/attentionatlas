@@ -130,8 +130,18 @@ async function generateText() {
 function useGeneratedText() {
     const analyzeTextarea = document.getElementById('analyze-text');
     const structuredDiv = document.getElementById('analyze-text-structured');
+    const noTextMessage = document.getElementById('no-text-message');
+    const analyzeButton = document.getElementById('analyze-button');
 
     const combinedDocumentContext = uploadedDocuments.map(doc => doc.content).join('\n\n---\n\n');
+
+    // Enable the analyze button
+    analyzeButton.disabled = false;
+
+    // Hide "no text" message
+    if (noTextMessage) {
+        noTextMessage.style.display = 'none';
+    }
 
     // Carry over the text structure for visualization
     if (uploadedDocuments.length > 0) {
@@ -143,8 +153,7 @@ function useGeneratedText() {
             boundaries: currentTokenBoundaries // Include token boundaries
         };
 
-        // Hide textarea, show structured display
-        analyzeTextarea.style.display = 'none';
+        // Show structured display
         structuredDiv.style.display = 'block';
         structuredDiv.innerHTML = '';
 
@@ -168,11 +177,10 @@ function useGeneratedText() {
         analyzeTextarea.value = currentGeneratedText;
     } else {
         currentAnalyzedTextStructure = null;
-        // Show textarea, hide structured display
-        analyzeTextarea.style.display = 'block';
-        structuredDiv.style.display = 'none';
+        // Show simple display
+        structuredDiv.style.display = 'block';
+        structuredDiv.innerHTML = `<div class="response-section"><div class="section-label">Generated Text</div><div class="response-text">${currentGeneratedText}</div></div>`;
         analyzeTextarea.value = currentGeneratedText;
-        autoResizeTextarea(analyzeTextarea);
     }
 
     // Switch tabs first so the content is visible
@@ -192,7 +200,7 @@ async function analyzeText() {
     const attnLayer = parseInt(document.getElementById('attn-layer').value);
 
     if (!text) {
-        showError('visualize-error', 'Please enter text to analyze');
+        showError('visualize-error', 'Please generate text first in the Generate tab');
         return;
     }
 
