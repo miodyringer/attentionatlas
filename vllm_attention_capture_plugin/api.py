@@ -21,7 +21,7 @@ _CAPTURE_HOOKS: dict[int, AttentionCaptureHook] = {}
 
 def enable_attention_capture(
     llm: Any,  # vllm.LLM
-    capture_layers: list[int] | -1 | None = None,
+    capture_layers: list[int] | int | None = None,
     attention_window: int | None = None,
     auto_clear: bool = True,
 ) -> None:
@@ -81,8 +81,11 @@ def enable_attention_capture(
     """
     if capture_layers is None:
         capture_layers = [0, 1, 2]  # Default: first 3 layers
-    if capture_layers is -1:
-        capture_layers = range(llm.model_config.get_num_layers()) # All layers
+    if type(capture_layers) is int:
+        if capture_layers == -1:
+            capture_layers = range(llm.model_config.get_num_layers()) # All layers
+        else:
+            capture_layers = [0, 1, 2]
 
     logger.info(
         "Enabling attention capture: layers=%s, window=%s, auto_clear=%s",
