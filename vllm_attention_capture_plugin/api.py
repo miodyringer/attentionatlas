@@ -21,7 +21,7 @@ _CAPTURE_HOOKS: dict[int, AttentionCaptureHook] = {}
 
 def enable_attention_capture(
     llm: Any,  # vllm.LLM
-    capture_layers: list[int] | None = None,
+    capture_layers: list[int] | -1 | None = None,
     attention_window: int | None = None,
     auto_clear: bool = True,
 ) -> None:
@@ -33,7 +33,7 @@ def enable_attention_capture(
     Args:
         llm: A vLLM LLM instance
         capture_layers: List of layer indices to capture (e.g., [0, 1, 2]).
-                       If None, captures first 3 layers.
+                       If None, captures first 3 layers. If -1, captures all layers.
         attention_window: Number of recent tokens to capture attention for.
                          If None, captures full attention matrix (higher memory).
                          If set (e.g., 5), only captures last N positions (memory efficient).
@@ -81,6 +81,8 @@ def enable_attention_capture(
     """
     if capture_layers is None:
         capture_layers = [0, 1, 2]  # Default: first 3 layers
+    if capture_layers is -1:
+        capture_layers = range(llm.model_config.get_num_layers()) # All layers
 
     logger.info(
         "Enabling attention capture: layers=%s, window=%s, auto_clear=%s",
