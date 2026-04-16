@@ -209,10 +209,6 @@ class AttentionCaptureHook:
                     concatenated = np.concatenate(converted_list, axis=1)
 
                 result[layer_idx] = concatenated
-                logger.debug(
-                    "Layer %d: concatenated %d captures into shape %s",
-                    layer_idx, len(score_list), concatenated.shape
-                )
             except Exception as e:
                 logger.error(
                     "Failed to concatenate scores for layer %d: %s. "

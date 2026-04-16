@@ -89,18 +89,6 @@ def enable_attention_capture(
         auto_clear,
     )
 
-    # Debug: Write to file FIRST to ensure it happens
-    try:
-        with open('/tmp/vllm_debug.txt', 'w') as f:
-            f.write("=== DIAGNOSTIC: enable_attention_capture called ===\n")
-            f.write(f"llm type: {type(llm)}\n")
-            f.write(f"llm_engine type: {type(llm.llm_engine)}\n")
-            f.write(f"llm_engine has engine_core: {hasattr(llm.llm_engine, 'engine_core')}\n")
-            f.write(f"llm_engine has model_executor: {hasattr(llm.llm_engine, 'model_executor')}\n")
-            f.write(f"llm_engine dir: {dir(llm.llm_engine)}\n\n")
-    except Exception as e:
-        logger.error(f"Failed to write debug file: {e}")
-
     # Create capture hook
     hook = AttentionCaptureHook(attention_window, capture_layers)
     hook.auto_clear = auto_clear  # Store config in hook
@@ -111,26 +99,6 @@ def enable_attention_capture(
 
     # Patch the model's attention layers
     try:
-        # Debug: inspect llm.llm_engine structure - write to file
-        with open('/tmp/vllm_debug.txt', 'w') as f:
-            f.write("=== DIAGNOSTIC: Inspecting vLLM Engine Structure ===\n")
-            f.write(f"llm_engine type: {type(llm.llm_engine)}\n")
-            f.write(f"llm_engine dir: {dir(llm.llm_engine)}\n\n")
-
-            if hasattr(llm.llm_engine, "engine_core"):
-                f.write("engine_core EXISTS\n")
-                f.write(f"engine_core type: {type(llm.llm_engine.engine_core)}\n")
-                f.write(f"engine_core dir: {dir(llm.llm_engine.engine_core)}\n\n")
-            else:
-                f.write("engine_core does NOT exist\n\n")
-
-            if hasattr(llm.llm_engine, "model_executor"):
-                f.write("model_executor EXISTS\n")
-                f.write(f"model_executor type: {type(llm.llm_engine.model_executor)}\n")
-                f.write(f"model_executor dir: {dir(llm.llm_engine.model_executor)}\n\n")
-            else:
-                f.write("model_executor does NOT exist\n\n")
-
         # Access model - handle both v0 and v1 engine structures
         model = None
 
