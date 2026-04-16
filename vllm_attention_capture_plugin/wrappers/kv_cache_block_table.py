@@ -71,14 +71,8 @@ def extract_kv_from_cache_using_block_table(
     # Calculate how many blocks we need for cache_len tokens
     num_blocks_needed = (cache_len + block_size - 1) // block_size
 
-    logger.debug(
-        f"Extracting KV using block_table: seq_len={seq_len}, cache_len={cache_len}, "
-        f"block_size={block_size}, num_blocks_needed={num_blocks_needed}"
-    )
-
     # Get the actual block indices we need
     block_indices = request_blocks[:num_blocks_needed]
-    logger.debug(f"Block indices for request {request_idx}: {block_indices}")
 
     # Validate block indices
     max_block_idx = block_indices.max().item() if len(block_indices) > 0 else -1
@@ -107,8 +101,6 @@ def extract_kv_from_cache_using_block_table(
     # Trim to exact cache length (last block might be partially filled)
     keys = keys[:cache_len]
     values = values[:cache_len]
-
-    logger.debug(f"Extracted cached K/V: keys={keys.shape}, values={values.shape}")
 
     return keys, values
 
