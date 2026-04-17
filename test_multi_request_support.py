@@ -9,6 +9,11 @@ Tests:
 4. Request isolation (verify no data mixing)
 """
 
+import os
+
+# Enable pickle serialization for vLLM v1 RPC
+os.environ['VLLM_ALLOW_INSECURE_SERIALIZATION'] = '1'
+
 import numpy as np
 from vllm import LLM, SamplingParams
 
