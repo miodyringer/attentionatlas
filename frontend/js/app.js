@@ -113,6 +113,7 @@ async function generateText() {
             <div class="metadata-item"><strong>Model:</strong> ${data.model}</div>
             <div class="metadata-item"><strong>Temperature:</strong> ${metadata.temperature}</div>
             <div class="metadata-item"><strong>Total Tokens:</strong> ${metadata.total_tokens}</div>
+            <div class="metadata-item"><strong>Prefill Tokens:</strong> ${metadata.prefill_tokens || metadata.prompt_tokens}</div>
             ${metadata.has_document_context ? `<div class="metadata-item"><strong>Context:</strong> ${metadata.context_token_count} tokens</div>` : ''}
             ${metadata.has_document_context ? `<div class="metadata-item"><strong>Question:</strong> ${metadata.user_prompt_token_count} tokens</div>` : ''}
             <div class="metadata-item"><strong>Response:</strong> ${metadata.generated_tokens} tokens</div>
@@ -221,7 +222,9 @@ async function analyzeText() {
             <div class="metadata-item"><strong>Layers:</strong> ${numLayers}</div>
             <div class="metadata-item"><strong>Heads:</strong> ${numHeads}</div>
             <div class="metadata-item"><strong>Sequence Length:</strong> ${seqLen}</div>
-            <div class="metadata-item"><strong>Tokens:</strong> ${data.num_tokens}</div>
+            <div class="metadata-item"><strong>Total Tokens:</strong> ${data.num_tokens}</div>
+            ${data.prefill_tokens ? `<div class="metadata-item"><strong>Prefill Tokens:</strong> ${data.prefill_tokens}</div>` : ''}
+            ${data.prefill_tokens ? `<div class="metadata-item"><strong>Decode Tokens:</strong> ${data.num_tokens - data.prefill_tokens}</div>` : ''}
         `;
 
         document.getElementById('analyze-output-card').style.display = 'block';

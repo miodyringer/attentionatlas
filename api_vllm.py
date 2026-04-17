@@ -111,6 +111,7 @@ class AnalyzeResponse(BaseModel):
     shape: list[int]
     num_tokens: int
     tokens: list[str]
+    prefill_tokens: Optional[int] = None  # Number of prefill tokens
 
 
 def count_tokens(text: str, llm_instance: LLM) -> int:
@@ -187,7 +188,8 @@ async def generate_answer(request: GenerateRequest):
         attention_cache[full_text_for_cache] = {
             "scores": attention_scores,
             "tokens": token_strings,
-            "num_tokens": len(token_strings)
+            "num_tokens": len(token_strings),
+            "prefill_tokens": int(prompt_length)  # Store prefill count
         }
 
         print(f"✅ Cached attention weights for {len(token_strings)} tokens")
@@ -204,6 +206,7 @@ async def generate_answer(request: GenerateRequest):
                 "temperature": request.temperature,
                 "max_tokens": request.max_tokens,
                 "prompt_tokens": int(prompt_length),
+                "prefill_tokens": int(prompt_length),  # Add explicit prefill token count
                 "generated_tokens": int(actual_new_tokens),
                 "new_text": new_answer,
                 "total_tokens": int(total_length),
@@ -240,6 +243,8 @@ async def analyze_answer(request: AnalyzeRequest):
         scores = cached_data["scores"]
         token_strings = cached_data["tokens"]
         num_tokens = cached_data["num_tokens"]
+        # Calculate prefill tokens from the cache metadata if available
+        prefill_tokens = cached_data.get("prefill_tokens", None)
 
         if scores is None:
             raise HTTPException(status_code=500, detail="No attention scores in cache")
@@ -274,7 +279,8 @@ async def analyze_answer(request: AnalyzeRequest):
             attention_pattern=attn_list,
             shape=shape,
             num_tokens=num_tokens,
-            tokens=token_strings
+            tokens=token_strings,
+            prefill_tokens=prefill_tokens  # Include prefill count
         )
     except HTTPException:
         raise
