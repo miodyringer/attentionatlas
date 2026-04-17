@@ -5,7 +5,9 @@ This module patches vLLM's Attention layer (not the projection layers) to captur
 attention weights. At this level, Q/K/V have all model-specific transformations
 applied (RoPE, QK normalization, etc), so we capture the ACTUAL attention values.
 """
+import contextvars
 import logging
+import time
 from typing import Any
 import numpy as np
 
@@ -17,6 +19,30 @@ from vllm_attention_capture_plugin.hooks.attention_hook import AttentionCaptureH
 from vllm_attention_capture_plugin.wrappers import compute_attention_with_capture
 
 logger = logging.getLogger(__name__)
+
+# Context variable for user-provided request IDs
+_user_request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    'request_id', default=None
+)
+
+
+def get_or_generate_request_id() -> str:
+    """Get request ID from user context or generate a unique one.
+
+    This function tries to get a user-provided request ID from the context
+    variable. If none is set, it generates a unique timestamp-based ID.
+
+    Returns:
+        Request ID string
+    """
+    # Try user-provided ID first
+    user_id = _user_request_id.get()
+    if user_id is not None:
+        return str(user_id)
+
+    # Fall back to timestamp-based unique ID
+    # Using high-resolution timestamp ensures uniqueness even for concurrent requests
+    return f"req_{int(time.time() * 1000000)}"
 
 
 def patch_attention_layer(
@@ -96,27 +122,36 @@ def patch_attention_layer(
         if not capture_hook.should_capture(layer_idx):
             return original_forward(query, key, value, output_shape)
 
+        # Get or generate unique request ID
+        request_id = get_or_generate_request_id()
+
         # IMPORTANT: Store raw K/V BEFORE vLLM reshapes them into cache
-        # We'll use these for attention calculation instead of extracting from cache
+        # We use per-request accumulators to isolate different requests
         if key is not None and value is not None:
-            # Initialize accumulator if needed
-            if not hasattr(attention_layer, '_raw_kv_accumulator'):
-                attention_layer._raw_kv_accumulator = {
+            # Initialize per-request accumulator storage
+            if not hasattr(attention_layer, '_raw_kv_accumulators'):
+                attention_layer._raw_kv_accumulators = {}
+
+            # Get or create accumulator for this specific request
+            if request_id not in attention_layer._raw_kv_accumulators:
+                attention_layer._raw_kv_accumulators[request_id] = {
                     'keys': [],
                     'values': []
                 }
+
+            accumulator = attention_layer._raw_kv_accumulators[request_id]
 
             # Reshape: [num_tokens, num_kv_heads * head_size] -> [num_tokens, num_kv_heads, head_size]
             k_reshaped = key.view(num_tokens, num_kv_heads, head_size)
             v_reshaped = value.view(num_tokens, num_kv_heads, head_size)
 
             if is_decode:
-                # Decode: append new token to accumulator
-                attention_layer._raw_kv_accumulator['keys'].append(k_reshaped)
-                attention_layer._raw_kv_accumulator['values'].append(v_reshaped)
+                # Decode: append new token to this request's accumulator
+                accumulator['keys'].append(k_reshaped)
+                accumulator['values'].append(v_reshaped)
             else:
-                # Prefill: reset and store all tokens
-                attention_layer._raw_kv_accumulator = {
+                # Prefill: reset this request's accumulator
+                attention_layer._raw_kv_accumulators[request_id] = {
                     'keys': [k_reshaped],
                     'values': [v_reshaped]
                 }
@@ -159,14 +194,24 @@ def patch_attention_layer(
                 # ============================================================
                 # DECODE PHASE: One new token, attend to all previous + self
                 # ============================================================
-                # Use accumulated raw K/V instead of extracting from cache
-                if not hasattr(attention_layer, '_raw_kv_accumulator'):
-                    logger.warning(f"Layer {layer_idx}: No raw K/V accumulator, skipping decode capture")
+                # Use accumulated raw K/V for this specific request
+                if not hasattr(attention_layer, '_raw_kv_accumulators'):
+                    logger.warning(f"Layer {layer_idx}: No K/V accumulators, skipping decode capture")
                     return result
 
-                # Concatenate all accumulated keys and values
-                all_keys = torch.cat(attention_layer._raw_kv_accumulator['keys'], dim=0)
-                all_values = torch.cat(attention_layer._raw_kv_accumulator['values'], dim=0)
+                if request_id not in attention_layer._raw_kv_accumulators:
+                    logger.warning(
+                        f"Layer {layer_idx}: No accumulator for request {request_id}, "
+                        "skipping decode capture"
+                    )
+                    return result
+
+                # Get this request's accumulator
+                accumulator = attention_layer._raw_kv_accumulators[request_id]
+
+                # Concatenate all accumulated keys and values for this request
+                all_keys = torch.cat(accumulator['keys'], dim=0)
+                all_values = torch.cat(accumulator['values'], dim=0)
                 context_len = all_keys.shape[0]
 
                 # Reshape query: [1, num_heads * head_size] -> [1, num_heads, head_size]
@@ -200,8 +245,7 @@ def patch_attention_layer(
                 # Softmax to get attention weights
                 attn_weights = torch.softmax(attn_scores, dim=-1)
 
-            # Store attention weights via capture hook
-            request_id = "default_request"
+            # Store attention weights via capture hook with the actual request ID
             capture_hook.capture_attention_weights(
                 layer_idx=layer_idx,
                 attn_weights=attn_weights,

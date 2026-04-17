@@ -5,11 +5,13 @@ This module provides the main API for enabling attention capture in vLLM.
 """
 
 import logging
+from contextlib import contextmanager
 from typing import Any
 
 from vllm_attention_capture_plugin.hooks.attention_hook import AttentionCaptureHook
 from vllm_attention_capture_plugin.wrappers.attention_layer_patcher import (
     patch_model_for_attention_capture,
+    _user_request_id,  # Import the context variable
 )
 
 logger = logging.getLogger(__name__)
@@ -402,6 +404,49 @@ def get_latest_attention_scores() -> dict[int, Any] | None:
     return None
 
 
+@contextmanager
+def set_request_context(request_id: str):
+    """Set request ID for the current generation context.
+
+    Use this context manager when you want to provide your own request IDs
+    instead of using automatically generated timestamp-based IDs.
+
+    Args:
+        request_id: Your custom request identifier
+
+    Example:
+        ```python
+        from vllm import LLM, SamplingParams
+        from vllm_attention_capture_plugin import (
+            enable_attention_capture,
+            set_request_context,
+            get_attention_scores
+        )
+
+        llm = LLM(model="gpt2")
+        enable_attention_capture(llm)
+
+        # Use custom request IDs
+        with set_request_context("my_request_1"):
+            outputs = llm.generate("Hello", SamplingParams(max_tokens=10))
+
+        # Retrieve using your custom ID
+        scores = get_attention_scores("my_request_1")
+        print(f"Layer 0 attention shape: {scores[0].shape}")
+        ```
+
+    Note:
+        Without this context manager, the plugin automatically generates
+        unique timestamp-based IDs for each request. Use this when you need
+        explicit control over request identification.
+    """
+    token = _user_request_id.set(request_id)
+    try:
+        yield
+    finally:
+        _user_request_id.reset(token)
+
+
 __all__ = [
     "enable_attention_capture",
     "disable_attention_capture",
@@ -410,4 +455,6 @@ __all__ = [
     "get_capture_hook",
     "get_capture_config",
     "clear_all_captures",
+    "set_request_context",  # New API
 ]
+

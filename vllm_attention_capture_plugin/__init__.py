@@ -41,6 +41,7 @@ from vllm_attention_capture_plugin.api import (
     get_capture_config,
     get_capture_hook,
     get_latest_attention_scores,
+    set_request_context,  # New API for multi-request support
 )
 from vllm_attention_capture_plugin.hooks.attention_hook import AttentionCaptureHook
 
@@ -53,4 +54,5 @@ __all__ = [
     "get_capture_hook",
     "get_capture_config",
     "clear_all_captures",
+    "set_request_context",  # New API for multi-request support
 ]
