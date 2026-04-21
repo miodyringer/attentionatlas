@@ -109,20 +109,45 @@ def extract_request_ranges(
     """
     # Skip if single request or no batch mapping
     if not batch_mapping or len(batch_mapping) <= 1:
+        print(f"  extract_request_ranges: batch_mapping={batch_mapping} -> returning None (single/no batch)")
         return None
 
-    # Try to access attention metadata
+    # Try to access attention metadata (v1 API)
     attn_metadata = getattr(attention_layer, 'attn_metadata', None)
+    print(f"  extract_request_ranges: attn_metadata from layer={attn_metadata}")
+
+    # Try to get from ForwardContext (v0 API)
     if attn_metadata is None:
+        try:
+            from vllm.forward_context import get_forward_context
+            forward_ctx = get_forward_context()
+            print(f"  extract_request_ranges: forward_ctx={forward_ctx}")
+            if forward_ctx is not None:
+                attn_metadata = getattr(forward_ctx, 'attn_metadata', None)
+                print(f"  extract_request_ranges: attn_metadata from forward_ctx={attn_metadata}")
+        except Exception as e:
+            print(f"  extract_request_ranges: Failed to get forward_context: {e}")
+
+    if attn_metadata is None:
+        print(f"  extract_request_ranges: attn_metadata is None -> returning None")
         return None
 
     # Check for query_start_loc attribute (contains cumulative token positions)
-    if not hasattr(attn_metadata, 'query_start_loc'):
+    has_query_start_loc = hasattr(attn_metadata, 'query_start_loc')
+    print(f"  extract_request_ranges: has query_start_loc? {has_query_start_loc}")
+
+    if not has_query_start_loc:
+        # Try alternative attribute names
+        attrs = [attr for attr in dir(attn_metadata) if not attr.startswith('_')]
+        print(f"  extract_request_ranges: Available attributes: {attrs[:20]}")  # First 20 to avoid spam
         return None
 
     query_start_loc = attn_metadata.query_start_loc
+    print(f"  extract_request_ranges: query_start_loc={query_start_loc}")
+
     if query_start_loc is None or len(query_start_loc) < 2:
         # Need at least 2 elements to define a range
+        print(f"  extract_request_ranges: query_start_loc is None or too short -> returning None")
         return None
 
     # Convert to CPU numpy for indexing
@@ -139,6 +164,7 @@ def extract_request_ranges(
         if req_id:
             request_ranges.append((start, end, req_id))
 
+    print(f"  extract_request_ranges: Extracted {len(request_ranges)} ranges: {request_ranges}")
     return request_ranges if request_ranges else None
 
 
