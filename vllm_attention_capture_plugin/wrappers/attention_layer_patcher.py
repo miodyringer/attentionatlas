@@ -81,6 +81,67 @@ def get_or_generate_request_id(batch_idx: int = 0) -> str:
     return new_session_id
 
 
+def extract_request_ranges(
+    attention_layer: Any,
+    batch_mapping: dict[int, str] | None
+) -> list[tuple[int, int, str]] | None:
+    """Extract per-request token ranges from attention metadata.
+
+    This function accesses vLLM's AttentionMetadata to determine where each
+    request's tokens are located in the concatenated batch tensor.
+
+    Args:
+        attention_layer: The vLLM Attention layer instance with attn_metadata attribute
+        batch_mapping: Dict mapping batch_idx → request_id (from _batch_req_id_mapping)
+
+    Returns:
+        List of (start_pos, end_pos, request_id) tuples for each request in batch,
+        or None if batch splitting is not possible/needed.
+
+        Example: [(0, 6, 'req-123'), (6, 9, 'req-456')]
+        Means: Request 'req-123' uses tokens [0:6], Request 'req-456' uses tokens [6:9]
+
+    Returns None when:
+        - Single request batch (len(batch_mapping) <= 1)
+        - AttentionMetadata unavailable
+        - query_start_loc attribute missing
+        - query_start_loc is None or too short
+    """
+    # Skip if single request or no batch mapping
+    if not batch_mapping or len(batch_mapping) <= 1:
+        return None
+
+    # Try to access attention metadata
+    attn_metadata = getattr(attention_layer, 'attn_metadata', None)
+    if attn_metadata is None:
+        return None
+
+    # Check for query_start_loc attribute (contains cumulative token positions)
+    if not hasattr(attn_metadata, 'query_start_loc'):
+        return None
+
+    query_start_loc = attn_metadata.query_start_loc
+    if query_start_loc is None or len(query_start_loc) < 2:
+        # Need at least 2 elements to define a range
+        return None
+
+    # Convert to CPU numpy for indexing
+    query_start_loc = query_start_loc.cpu().numpy()
+    num_reqs = len(query_start_loc) - 1
+
+    # Extract ranges for each request
+    request_ranges = []
+    for req_idx in range(num_reqs):
+        start = int(query_start_loc[req_idx])
+        end = int(query_start_loc[req_idx + 1])
+        req_id = batch_mapping.get(req_idx)
+
+        if req_id:
+            request_ranges.append((start, end, req_id))
+
+    return request_ranges if request_ranges else None
+
+
 def patch_attention_layer(
     attention_layer: Any,
     layer_idx: int,
@@ -158,17 +219,9 @@ def patch_attention_layer(
         if not capture_hook.should_capture(layer_idx):
             return original_forward(query, key, value, output_shape)
 
-        # Get request ID(s) for this forward pass
-        # For batched requests, we use the first ID (limitation: concurrent requests
-        # will share attention data under one ID)
-        batch_mapping = _batch_req_id_mapping.get()
-
-        if batch_mapping and len(batch_mapping) > 0:
-            # Use first request ID from batch
-            request_id = list(batch_mapping.values())[0]
-        else:
-            # Single request or no mapping - use standard logic
-            request_id = get_or_generate_request_id()
+        # Get fallback request ID for single-request scenarios
+        # For multi-request batches, IDs are determined per-request in split logic
+        request_id = get_or_generate_request_id()
 
         # IMPORTANT: Store raw K/V BEFORE vLLM reshapes them into cache
         # We use per-request accumulators to isolate different requests
@@ -177,29 +230,70 @@ def patch_attention_layer(
             if not hasattr(attention_layer, '_raw_kv_accumulators'):
                 attention_layer._raw_kv_accumulators = {}
 
-            # Get or create accumulator for this specific request
-            if request_id not in attention_layer._raw_kv_accumulators:
-                attention_layer._raw_kv_accumulators[request_id] = {
-                    'keys': [],
-                    'values': []
-                }
+            batch_mapping = _batch_req_id_mapping.get()
+            request_ranges = extract_request_ranges(attention_layer, batch_mapping)
 
-            accumulator = attention_layer._raw_kv_accumulators[request_id]
+            if request_ranges and not is_decode:
+                # Multi-request prefill: split K/V by request boundaries
+                print(f"🔹 Layer {layer_idx}: Prefill with {len(request_ranges)} requests")
+                for start, end, req_id in request_ranges:
+                    num_tokens_req = end - start
+                    k_req = key[start:end].view(num_tokens_req, num_kv_heads, head_size)
+                    v_req = value[start:end].view(num_tokens_req, num_kv_heads, head_size)
 
-            # Reshape: [num_tokens, num_kv_heads * head_size] -> [num_tokens, num_kv_heads, head_size]
-            k_reshaped = key.view(num_tokens, num_kv_heads, head_size)
-            v_reshaped = value.view(num_tokens, num_kv_heads, head_size)
+                    # Reset this request's accumulator (prefill)
+                    attention_layer._raw_kv_accumulators[req_id] = {
+                        'keys': [k_req],
+                        'values': [v_req]
+                    }
+                    print(f"  Request {req_id}: stored {num_tokens_req} tokens in accumulator")
+            elif request_ranges and is_decode:
+                # Multi-request decode: split K/V by request boundaries
+                print(f"🔹 Layer {layer_idx}: Decode with {len(request_ranges)} requests")
+                for start, end, req_id in request_ranges:
+                    num_tokens_req = end - start
+                    k_req = key[start:end].view(num_tokens_req, num_kv_heads, head_size)
+                    v_req = value[start:end].view(num_tokens_req, num_kv_heads, head_size)
 
-            if is_decode:
-                # Decode: append new token to this request's accumulator
-                accumulator['keys'].append(k_reshaped)
-                accumulator['values'].append(v_reshaped)
+                    # Append to this request's accumulator
+                    if req_id not in attention_layer._raw_kv_accumulators:
+                        print(f"  ⚠️  Layer {layer_idx}: No accumulator for request {req_id} during decode K/V append")
+                        attention_layer._raw_kv_accumulators[req_id] = {
+                            'keys': [],
+                            'values': []
+                        }
+
+                    attention_layer._raw_kv_accumulators[req_id]['keys'].append(k_req)
+                    attention_layer._raw_kv_accumulators[req_id]['values'].append(v_req)
+                    print(f"  Request {req_id}: appended {num_tokens_req} tokens to accumulator")
             else:
-                # Prefill: reset this request's accumulator
-                attention_layer._raw_kv_accumulators[request_id] = {
-                    'keys': [k_reshaped],
-                    'values': [v_reshaped]
-                }
+                # Single request or no metadata: use original logic
+                request_id = get_or_generate_request_id()
+                print(f"🔹 Layer {layer_idx}: Single request mode, request_id={request_id}, is_decode={is_decode}")
+
+                # Get or create accumulator for this specific request
+                if request_id not in attention_layer._raw_kv_accumulators:
+                    attention_layer._raw_kv_accumulators[request_id] = {
+                        'keys': [],
+                        'values': []
+                    }
+
+                accumulator = attention_layer._raw_kv_accumulators[request_id]
+
+                # Reshape: [num_tokens, num_kv_heads * head_size] -> [num_tokens, num_kv_heads, head_size]
+                k_reshaped = key.view(num_tokens, num_kv_heads, head_size)
+                v_reshaped = value.view(num_tokens, num_kv_heads, head_size)
+
+                if is_decode:
+                    # Decode: append new token to this request's accumulator
+                    accumulator['keys'].append(k_reshaped)
+                    accumulator['values'].append(v_reshaped)
+                else:
+                    # Single-request prefill: reset accumulator
+                    attention_layer._raw_kv_accumulators[request_id] = {
+                        'keys': [k_reshaped],
+                        'values': [v_reshaped]
+                    }
 
         # Call vLLM's original forward first (don't modify behavior)
         result = original_forward(query, key, value, output_shape)
@@ -292,12 +386,97 @@ def patch_attention_layer(
                 # Shape: [num_heads, 1, context_len] where context_len includes ALL tokens (prefill + previous decodes + current)
                 attn_weights = torch.softmax(attn_scores, dim=-1)
 
-            # Store attention weights via capture hook with the actual request ID
-            capture_hook.capture_attention_weights(
-                layer_idx=layer_idx,
-                attn_weights=attn_weights,
-                request_id=request_id,
-            )
+            # Store attention weights - split by request if batch has multiple requests
+            batch_mapping = _batch_req_id_mapping.get()
+            request_ranges = extract_request_ranges(attention_layer, batch_mapping)
+
+            print(f"🔸 Layer {layer_idx}: is_decode={is_decode}, batch_mapping={batch_mapping}, request_ranges={request_ranges}")
+
+            if request_ranges:
+                if not is_decode:
+                    # Multi-request prefill: split attention by request boundaries
+                    # Each request attends only to its own tokens (diagonal blocks)
+                    print(f"🔸 Layer {layer_idx}: Multi-request prefill with {len(request_ranges)} requests")
+                    for start, end, req_id in request_ranges:
+                        # Extract this request's attention to its own context
+                        # Shape: [num_heads, num_tokens_this_req, num_tokens_this_req]
+                        req_attn = attn_weights[:, start:end, start:end]
+
+                        print(f"  Storing prefill attention for request {req_id}: shape {req_attn.shape}")
+                        capture_hook.capture_attention_weights(
+                            layer_idx=layer_idx,
+                            attn_weights=req_attn,
+                            request_id=req_id,
+                        )
+                else:
+                    # Multi-request decode: process each request's token separately
+                    print(f"🔸 Layer {layer_idx}: Multi-request decode with {len(request_ranges)} requests")
+                    # Check for accumulators
+                    if not hasattr(attention_layer, '_raw_kv_accumulators'):
+                        print(f"  ⚠️  Layer {layer_idx}: No K/V accumulators, skipping multi-request decode capture")
+                        return result
+
+                    print(f"  Accumulators present: {list(attention_layer._raw_kv_accumulators.keys())}")
+
+                    for start, end, req_id in request_ranges:
+                        if req_id not in attention_layer._raw_kv_accumulators:
+                            print(f"  ⚠️  Layer {layer_idx}: No accumulator for request {req_id}, skipping decode capture for this request")
+                            continue
+
+                        print(f"  Processing decode for request {req_id}, tokens [{start}:{end}]")
+
+                        # This request's query (should be 1 token during decode)
+                        q_req = query[start:end]  # [1, num_heads * head_size]
+                        num_tokens_req = end - start
+
+                        # Validate: should be 1 token per request during decode
+                        if num_tokens_req != 1:
+                            print(f"  ⚠️  Layer {layer_idx}: Decode phase but request {req_id} has {num_tokens_req} tokens (expected 1)")
+
+                        # Get this request's accumulated K/V
+                        accumulator = attention_layer._raw_kv_accumulators[req_id]
+                        all_keys = torch.cat(accumulator['keys'], dim=0)  # [context_len, num_kv_heads, head_size]
+                        all_values = torch.cat(accumulator['values'], dim=0)
+                        context_len = all_keys.shape[0]
+
+                        print(f"    Accumulator has {len(accumulator['keys'])} K/V chunks, context_len={context_len}")
+
+                        # Reshape query
+                        q = q_req.view(num_tokens_req, num_heads, head_size)  # [1, num_heads, head_size]
+
+                        # Handle GQA: expand KV heads
+                        if num_heads != num_kv_heads:
+                            num_queries_per_kv = num_heads // num_kv_heads
+                            all_keys = all_keys.unsqueeze(2).expand(
+                                context_len, num_kv_heads, num_queries_per_kv, head_size
+                            ).reshape(context_len, num_heads, head_size)
+                            all_values = all_values.unsqueeze(2).expand(
+                                context_len, num_kv_heads, num_queries_per_kv, head_size
+                            ).reshape(context_len, num_heads, head_size)
+
+                        # Transpose for attention
+                        q_t = q.transpose(0, 1)  # [num_heads, 1, head_size]
+                        k_t = all_keys.transpose(0, 1)  # [num_heads, context_len, head_size]
+
+                        # Compute attention scores
+                        attn_scores_req = torch.matmul(q_t, k_t.transpose(-2, -1)) * scale  # [num_heads, 1, context_len]
+                        attn_weights_req = torch.softmax(attn_scores_req, dim=-1)
+
+                        print(f"    Storing decode attention for request {req_id}: shape {attn_weights_req.shape}")
+                        # Store attention for this specific request
+                        capture_hook.capture_attention_weights(
+                            layer_idx=layer_idx,
+                            attn_weights=attn_weights_req,
+                            request_id=req_id,
+                        )
+            else:
+                # Single request, no metadata, or decode phase without splitting
+                # Use the already-computed attn_weights
+                capture_hook.capture_attention_weights(
+                    layer_idx=layer_idx,
+                    attn_weights=attn_weights,
+                    request_id=request_id,
+                )
 
         except Exception as e:
             import traceback
