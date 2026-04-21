@@ -38,9 +38,9 @@ model = LLM(
 # Enable attention capture with full attention (no windowing)
 enable_attention_capture(
     model,
-    capture_layers=[0, 1, 2],  # First 3 layers
+    capture_layers=None,  # First 3 layers
     attention_window=None,  # Capture full attention matrix
-    auto_clear=True
+    auto_clear=False
 )
 
 print("Attention capture enabled for primary model (full attention)")
@@ -62,7 +62,7 @@ if compare_model_name and compare_model_name.strip():
     # Enable capture for comparison model
     enable_attention_capture(
         compare_model,
-        capture_layers=[0, 1, 2],
+        capture_layers=None,
         attention_window=None,  # Full attention
         auto_clear=True
     )
@@ -156,6 +156,14 @@ async def generate_answer(request: GenerateRequest):
         # Count prompt tokens
         prompt_length = count_tokens(full_content, model)
 
+        # DEBUG: Check hook state before generation
+        from vllm_attention_capture_plugin import get_capture_hook
+        hook = get_capture_hook(model)
+        if hook:
+            print(f"🔍 BEFORE generate: hook has {len(hook.captured_scores)} requests")
+            for req_id, layers in hook.captured_scores.items():
+                print(f"   Request {req_id}: {len(layers)} layers")
+
         # Generate tokens with vLLM
         sampling_params = SamplingParams(
             temperature=request.temperature,
@@ -165,6 +173,18 @@ async def generate_answer(request: GenerateRequest):
 
         outputs = model.generate([full_content], sampling_params)
         output = outputs[0]
+
+        # DEBUG: Check hook state after generation
+        if hook:
+            print(f"🔍 AFTER generate: hook has {len(hook.captured_scores)} requests")
+            for req_id, layers in hook.captured_scores.items():
+                print(f"   Request {req_id}: {len(layers)} layers")
+                for layer_id, chunks in layers.items():
+                    print(f"      Layer {layer_id}: {len(chunks)} chunks")
+
+        # Small delay to ensure all decode attention has been captured
+        import time
+        time.sleep(0.1)
 
         # Extract generated text (full output includes prompt)
         full_answer = output.outputs[0].text
@@ -177,6 +197,14 @@ async def generate_answer(request: GenerateRequest):
         # CAPTURE ATTENTION WEIGHTS DURING GENERATION
         # Get the attention scores that were just captured
         attention_scores = get_latest_attention_scores()
+
+        if attention_scores:
+            print(f"✅ Captured attention for layers: {sorted(attention_scores.keys())}")
+            for layer_id, layer_attn in attention_scores.items():
+                print(f"   Layer {layer_id}: shape {layer_attn.shape}")
+                print(f"   Layer {layer_id}: type {type(layer_attn)}")
+        else:
+            print("⚠️  No attention scores captured!")
 
         # Tokenize the full text to get token strings
         tokenizer = model.get_tokenizer()
@@ -249,6 +277,10 @@ async def analyze_answer(request: AnalyzeRequest):
         if scores is None:
             raise HTTPException(status_code=500, detail="No attention scores in cache")
 
+        print(f"🔍 Available layers in cache: {sorted(scores.keys())}")
+        for layer_id, layer_attn in scores.items():
+            print(f"   Layer {layer_id}: shape {layer_attn.shape}")
+
         # Determine which layers to return based on request
         if request.attn_layer == -1:
             # All captured layers
@@ -263,10 +295,10 @@ async def analyze_answer(request: AnalyzeRequest):
         # Stack attention patterns from available layers
         attention_patterns = []
         for layer_id in layer_ids:
-            layer_attn = scores[layer_id]  # [num_heads, num_tokens, seq_len]
+            layer_attn = scores[layer_id]  # [num_heads, num_tokens, context_len]
             attention_patterns.append(layer_attn)
 
-        # Stack into tensor-like structure: [num_layers, num_heads, seq_len, seq_len]
+        # Stack into tensor-like structure: [num_layers, num_heads, num_tokens, context_len]
         attn = np.stack(attention_patterns)
 
         # Convert to list for JSON serialization
@@ -274,6 +306,9 @@ async def analyze_answer(request: AnalyzeRequest):
         shape = list(attn.shape)
 
         print(f"✅ Retrieved attention from cache: shape {shape}, {num_tokens} tokens")
+        print(f"   Shape breakdown: [layers={shape[0]}, heads={shape[1]}, num_tokens={shape[2]}, context_len={shape[3]}]")
+        print(f"   Prefill tokens: {prefill_tokens}")
+        print(f"   Decode tokens: {num_tokens - prefill_tokens if prefill_tokens else 'unknown'}")
 
         return AnalyzeResponse(
             attention_pattern=attn_list,

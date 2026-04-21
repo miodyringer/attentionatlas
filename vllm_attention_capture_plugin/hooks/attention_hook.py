@@ -155,9 +155,16 @@ class AttentionCaptureHook:
         if request_id not in self.captured_scores:
             return {}
 
+        print(f"🔍 get_captured_scores for request {request_id}")
+        print(f"   Layers in captured_scores: {list(self.captured_scores[request_id].keys())}")
+
         # For each layer, concatenate the captured tensors
         result = {}
         for layer_idx, score_list in self.captured_scores[request_id].items():
+            print(f"   Layer {layer_idx}: {len(score_list)} chunks")
+            for i, chunk in enumerate(score_list):
+                print(f"      Chunk {i}: shape {chunk.shape}")
+
             try:
                 # Convert bfloat16 tensors to float32
                 converted_list = []
@@ -208,6 +215,7 @@ class AttentionCaptureHook:
                 else:
                     concatenated = np.concatenate(converted_list, axis=1)
 
+                print(f"   Layer {layer_idx}: Final concatenated shape: {concatenated.shape}")
                 result[layer_idx] = concatenated
             except Exception as e:
                 logger.error(

@@ -45,7 +45,7 @@ def get_vllm_attention(prompt: str, model_name: str = "gpt2", max_tokens: int = 
     # Enable attention capture (full attention, no windowing)
     enable_attention_capture(
         llm,
-        capture_layers=[0],  # Just first layer for comparison
+        capture_layers=None,  # All layers but later just first layer for comparison
         attention_window=None  # Full attention
     )
 
@@ -69,8 +69,14 @@ def get_vllm_attention(prompt: str, model_name: str = "gpt2", max_tokens: int = 
     if scores is None or 0 not in scores:
         raise ValueError("No attention scores captured!")
 
-    # Get layer 0 attention: [num_heads, num_tokens, seq_len]
+    # Get layer 0 attention: [num_heads, num_tokens, context_len]
+    print(f"\n🔍 DEBUG - vLLM attention captured:")
+    print(f"   Layers captured: {sorted(scores.keys())}")
     attn = scores[0]
+    print(f"   Layer 0 shape: {attn.shape}")
+    print(f"   Expected format: [num_heads, num_tokens, context_len]")
+    if len(attn.shape) == 3:
+        print(f"   num_heads={attn.shape[0]}, num_tokens={attn.shape[1]}, context_len={attn.shape[2]}")
 
     # Get tokens
     tokenizer = llm.get_tokenizer()
@@ -79,6 +85,13 @@ def get_vllm_attention(prompt: str, model_name: str = "gpt2", max_tokens: int = 
 
     print(f"\nAttention shape: {attn.shape}")
     print(f"Tokens ({len(tokens)}): {tokens}")
+
+    # Verify shape consistency
+    if len(attn.shape) == 3:
+        if attn.shape[1] != len(tokens):
+            print(f"\n⚠️  WARNING: Attention num_tokens ({attn.shape[1]}) != actual tokens ({len(tokens)})")
+        if attn.shape[2] < len(tokens):
+            print(f"\n⚠️  WARNING: Context length ({attn.shape[2]}) < num tokens ({len(tokens)})")
 
     return attn, tokens, full_text
 
@@ -269,7 +282,21 @@ def print_attention_sample(vllm_attn, transformers_attn, tokens, num_tokens=5):
     print("SAMPLE ATTENTION VALUES (First 5x5 tokens, Head 0)")
     print("=" * 80)
 
+    # Debug: print actual shapes
+    print(f"\nDEBUG: vllm_attn shape: {vllm_attn.shape}")
+    print(f"DEBUG: transformers_attn shape: {transformers_attn.shape}")
+    print(f"DEBUG: num tokens: {len(tokens)}")
+
     n = min(num_tokens, len(tokens))
+
+    # Get actual dimensions
+    vllm_num_tokens = vllm_attn.shape[1]  # Query tokens
+    vllm_context_len = vllm_attn.shape[2]  # Key tokens (context)
+
+    print(f"DEBUG: vllm - num_tokens (queries): {vllm_num_tokens}, context_len (keys): {vllm_context_len}")
+
+    # Adjust n to be safe
+    n = min(n, vllm_num_tokens, vllm_context_len)
 
     print("\nvLLM Plugin:")
     print("     ", end="")
@@ -279,9 +306,18 @@ def print_attention_sample(vllm_attn, transformers_attn, tokens, num_tokens=5):
     for i in range(n):
         print(f"{tokens[i][:8]:>8}", end=" ")
         for j in range(n):
-            val = vllm_attn[0, i, j]
-            print(f"{val:8.4f}", end=" ")
-        print(f"  (sum: {vllm_attn[0, i, :].sum():.4f})")
+            if i < vllm_attn.shape[1] and j < vllm_attn.shape[2]:
+                val = vllm_attn[0, i, j]
+                print(f"{val:8.4f}", end=" ")
+            else:
+                print("  N/A   ", end=" ")
+
+        # Calculate sum safely
+        if i < vllm_attn.shape[1]:
+            row_sum = vllm_attn[0, i, :min(vllm_context_len, vllm_attn.shape[2])].sum()
+            print(f"  (sum: {row_sum:.4f})")
+        else:
+            print("  (sum: N/A)")
 
     print("\nHuggingFace Transformers:")
     print("     ", end="")
@@ -303,9 +339,12 @@ def print_attention_sample(vllm_attn, transformers_attn, tokens, num_tokens=5):
     for i in range(n):
         print(f"{tokens[i][:8]:>8}", end=" ")
         for j in range(n):
-            diff = abs(vllm_attn[0, i, j] - transformers_attn[0, i, j])
-            symbol = "✓" if diff < 0.01 else "⚠" if diff < 0.05 else "✗"
-            print(f"{diff:7.4f}{symbol}", end=" ")
+            if i < vllm_attn.shape[1] and j < vllm_attn.shape[2]:
+                diff = abs(vllm_attn[0, i, j] - transformers_attn[0, i, j])
+                symbol = "✓" if diff < 0.01 else "⚠" if diff < 0.05 else "✗"
+                print(f"{diff:7.4f}{symbol}", end=" ")
+            else:
+                print("  N/A   ", end=" ")
         print()
 
 

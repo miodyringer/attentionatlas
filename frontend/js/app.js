@@ -215,13 +215,15 @@ async function analyzeText() {
 
         const numLayers = data.shape[0];
         const numHeads = data.shape[1];
-        const seqLen = data.shape[2];
+        const numTokens = data.shape[2];  // Number of tokens (query tokens)
+        const contextLen = data.shape[3];  // Context length (key tokens) - may be larger due to padding
 
         document.getElementById('analyze-metadata').innerHTML = `
             <div class="metadata-item"><strong>Shape:</strong> [${data.shape.join(', ')}]</div>
             <div class="metadata-item"><strong>Layers:</strong> ${numLayers}</div>
             <div class="metadata-item"><strong>Heads:</strong> ${numHeads}</div>
-            <div class="metadata-item"><strong>Sequence Length:</strong> ${seqLen}</div>
+            <div class="metadata-item"><strong>Tokens:</strong> ${numTokens}</div>
+            <div class="metadata-item"><strong>Context Length:</strong> ${contextLen}</div>
             <div class="metadata-item"><strong>Total Tokens:</strong> ${data.num_tokens}</div>
             ${data.prefill_tokens ? `<div class="metadata-item"><strong>Prefill Tokens:</strong> ${data.prefill_tokens}</div>` : ''}
             ${data.prefill_tokens ? `<div class="metadata-item"><strong>Decode Tokens:</strong> ${data.num_tokens - data.prefill_tokens}</div>` : ''}

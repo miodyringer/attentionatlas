@@ -77,7 +77,9 @@ function initializeVisualization(attentionData) {
 
 // Populate control dropdowns based on data shape
 function populateControls(data) {
-    const [numLayers, numHeads, seqLen] = data.shape;
+    const [numLayers, numHeads, numTokens, contextLen] = data.shape;
+    // Use the smaller of numTokens and contextLen for resolution display
+    const displaySize = Math.min(numTokens, contextLen);
 
     // Layer selector
     const layerSelect = document.getElementById('layer-select');
@@ -121,16 +123,16 @@ function populateControls(data) {
     resolutionSelect.appendChild(autoOption);
 
     // Original resolution (only if not too large)
-    if (seqLen <= 256) {
+    if (displaySize <= 256) {
         const originalOption = document.createElement('option');
         originalOption.value = 'original';
-        originalOption.textContent = `Original (${seqLen}x${seqLen})`;
+        originalOption.textContent = `Original (${numTokens}x${contextLen})`;
         resolutionSelect.appendChild(originalOption);
     }
 
     // Fixed resolutions
     [32, 64, 128, 256].forEach(res => {
-        if (res < seqLen || seqLen > 256) {
+        if (res < displaySize || displaySize > 256) {
             const option = document.createElement('option');
             option.value = res;
             option.textContent = `${res}x${res}`;
@@ -139,10 +141,10 @@ function populateControls(data) {
     });
 
     // Set smart default
-    if (seqLen > 256) {
+    if (displaySize > 256) {
         visualizationState.resolution = 128;
         resolutionSelect.value = 128;
-    } else if (seqLen > 128) {
+    } else if (displaySize > 128) {
         visualizationState.resolution = 64;
         resolutionSelect.value = 64;
     } else {
@@ -200,23 +202,28 @@ function processAttentionData(data, options) {
     }
 
     // Step 2: Apply resolution pooling if needed
+    const numTokens = matrix.length;  // Query tokens (rows)
+    const contextLen = matrix[0].length;  // Key tokens (columns)
+    const maxDim = Math.max(numTokens, contextLen);
+
     let targetSize;
     if (options.resolution === 'auto') {
-        const seqLen = matrix.length;
-        if (seqLen > 256) {
+        if (maxDim > 256) {
             targetSize = 128;
-        } else if (seqLen > 128) {
+        } else if (maxDim > 128) {
             targetSize = 64;
         } else {
-            targetSize = seqLen;
+            targetSize = maxDim;
         }
     } else if (options.resolution === 'original') {
-        targetSize = matrix.length;
+        // No pooling - keep original rectangular shape
+        return matrix;
     } else {
         targetSize = parseInt(options.resolution);
     }
 
-    if (targetSize < matrix.length) {
+    // Pool to square matrix if target size is smaller than dimensions
+    if (targetSize < numTokens || targetSize < contextLen) {
         matrix = meanPool2D(matrix, targetSize);
     }
 
@@ -226,23 +233,24 @@ function processAttentionData(data, options) {
 // Aggregate attention across all heads in a layer
 function aggregateHeads(tensor, layerIdx) {
     const numHeads = tensor[layerIdx].length;
-    const seqLen = tensor[layerIdx][0].length;
+    const numTokens = tensor[layerIdx][0].length;  // Query tokens
+    const contextLen = tensor[layerIdx][0][0].length;  // Key tokens (context)
 
     // Initialize result matrix
-    const result = Array(seqLen).fill().map(() => Array(seqLen).fill(0));
+    const result = Array(numTokens).fill().map(() => Array(contextLen).fill(0));
 
     // Sum across heads
     for (let h = 0; h < numHeads; h++) {
-        for (let i = 0; i < seqLen; i++) {
-            for (let j = 0; j < seqLen; j++) {
+        for (let i = 0; i < numTokens; i++) {
+            for (let j = 0; j < contextLen; j++) {
                 result[i][j] += tensor[layerIdx][h][i][j];
             }
         }
     }
 
     // Average
-    for (let i = 0; i < seqLen; i++) {
-        for (let j = 0; j < seqLen; j++) {
+    for (let i = 0; i < numTokens; i++) {
+        for (let j = 0; j < contextLen; j++) {
             result[i][j] /= numHeads;
         }
     }
@@ -253,23 +261,24 @@ function aggregateHeads(tensor, layerIdx) {
 // Aggregate attention across all layers for a head
 function aggregateLayers(tensor, headIdx) {
     const numLayers = tensor.length;
-    const seqLen = tensor[0][headIdx].length;
+    const numTokens = tensor[0][headIdx].length;  // Query tokens
+    const contextLen = tensor[0][headIdx][0].length;  // Key tokens (context)
 
     // Initialize result matrix
-    const result = Array(seqLen).fill().map(() => Array(seqLen).fill(0));
+    const result = Array(numTokens).fill().map(() => Array(contextLen).fill(0));
 
     // Sum across layers
     for (let l = 0; l < numLayers; l++) {
-        for (let i = 0; i < seqLen; i++) {
-            for (let j = 0; j < seqLen; j++) {
+        for (let i = 0; i < numTokens; i++) {
+            for (let j = 0; j < contextLen; j++) {
                 result[i][j] += tensor[l][headIdx][i][j];
             }
         }
     }
 
     // Average
-    for (let i = 0; i < seqLen; i++) {
-        for (let j = 0; j < seqLen; j++) {
+    for (let i = 0; i < numTokens; i++) {
+        for (let j = 0; j < contextLen; j++) {
             result[i][j] /= numLayers;
         }
     }

@@ -25,24 +25,60 @@ _user_request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     'request_id', default=None
 )
 
+# Context variable for batch_idx -> vLLM request_id mapping
+# This is populated by patch_model_runner() before each forward pass
+_batch_req_id_mapping: contextvars.ContextVar[dict[int, str] | None] = contextvars.ContextVar(
+    'batch_req_id_mapping', default=None
+)
 
-def get_or_generate_request_id() -> str:
-    """Get request ID from user context or generate a unique one.
+# Session-level fallback request ID (one per generate() call)
+# Used when we can't get vLLM's native request ID
+_session_request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    'session_request_id', default=None
+)
 
-    This function tries to get a user-provided request ID from the context
-    variable. If none is set, it generates a unique timestamp-based ID.
+
+def get_or_generate_request_id(batch_idx: int = 0) -> str:
+    """Get request ID using vLLM's native request tracking or fallbacks.
+
+    Priority order:
+    1. User-provided ID from context variable (set_request_context)
+    2. vLLM's native request_id from batch mapping (populated by model runner patch)
+    3. Session-level fallback ID (one per generate() call)
+    4. Generate new timestamp-based ID as last resort
+
+    Args:
+        batch_idx: Batch index for multi-request batches (default: 0 for single request)
 
     Returns:
-        Request ID string
+        Request ID string that will be consistent across all layers and decode steps
     """
-    # Try user-provided ID first
+    # Priority 1: User-provided ID (explicit override)
     user_id = _user_request_id.get()
     if user_id is not None:
         return str(user_id)
 
-    # Fall back to timestamp-based unique ID
-    # Using high-resolution timestamp ensures uniqueness even for concurrent requests
-    return f"req_{int(time.time() * 1000000)}"
+    # Priority 2: vLLM's native request ID from batch mapping
+    batch_mapping = _batch_req_id_mapping.get()
+    if batch_mapping is not None and batch_idx in batch_mapping:
+        return batch_mapping[batch_idx]
+
+    # Priority 3: Session-level fallback (one per generate() call)
+    session_id = _session_request_id.get()
+    if session_id is not None:
+        return session_id
+
+    # Priority 4: Generate new timestamp-based ID and store as session ID
+    # This ensures all forward passes in this session use the same ID
+    new_session_id = f"req_{int(time.time() * 1000000)}"
+    _session_request_id.set(new_session_id)
+
+    logger.warning(
+        f"Could not get vLLM native request ID (batch_idx={batch_idx}), "
+        f"using session fallback: {new_session_id}"
+    )
+
+    return new_session_id
 
 
 def patch_attention_layer(
@@ -122,8 +158,17 @@ def patch_attention_layer(
         if not capture_hook.should_capture(layer_idx):
             return original_forward(query, key, value, output_shape)
 
-        # Get or generate unique request ID
-        request_id = get_or_generate_request_id()
+        # Get request ID(s) for this forward pass
+        # For batched requests, we use the first ID (limitation: concurrent requests
+        # will share attention data under one ID)
+        batch_mapping = _batch_req_id_mapping.get()
+
+        if batch_mapping and len(batch_mapping) > 0:
+            # Use first request ID from batch
+            request_id = list(batch_mapping.values())[0]
+        else:
+            # Single request or no mapping - use standard logic
+            request_id = get_or_generate_request_id()
 
         # IMPORTANT: Store raw K/V BEFORE vLLM reshapes them into cache
         # We use per-request accumulators to isolate different requests
@@ -210,6 +255,7 @@ def patch_attention_layer(
                 accumulator = attention_layer._raw_kv_accumulators[request_id]
 
                 # Concatenate all accumulated keys and values for this request
+                # This includes all prefill tokens + all previously generated decode tokens
                 all_keys = torch.cat(accumulator['keys'], dim=0)
                 all_values = torch.cat(accumulator['values'], dim=0)
                 context_len = all_keys.shape[0]
@@ -243,6 +289,7 @@ def patch_attention_layer(
                 attn_scores = attn_scores * scale
 
                 # Softmax to get attention weights
+                # Shape: [num_heads, 1, context_len] where context_len includes ALL tokens (prefill + previous decodes + current)
                 attn_weights = torch.softmax(attn_scores, dim=-1)
 
             # Store attention weights via capture hook with the actual request ID
@@ -366,4 +413,182 @@ def patch_model_for_attention_capture(
     )
 
 
-__all__ = ["patch_attention_layer", "patch_model_for_attention_capture"]
+def patch_model_runner(llm: Any) -> None:
+    """Patch the model runner to populate request ID mapping before forward passes.
+
+    This extracts vLLM's native request IDs from InputBatch and stores them in a
+    context variable so attention hooks can access them.
+
+    Args:
+        llm: The vLLM LLM instance
+    """
+    logger.info("Patching model runner for request ID tracking...")
+
+    try:
+        # Try v0 path first (direct access to model_executor)
+        if hasattr(llm.llm_engine, "model_executor"):
+            model_executor = llm.llm_engine.model_executor
+            if hasattr(model_executor, "driver_worker"):
+                model_runner = model_executor.driver_worker.model_runner
+                _patch_model_runner_execute(model_runner)
+                logger.info("✓ Successfully patched v0 model runner")
+                return
+
+        # v1 architecture - use RPC
+        if hasattr(llm.llm_engine, "engine_core"):
+            logger.info("Detected vLLM v1 - attempting RPC-based model runner patching")
+
+            def _patch_model_runner_on_engine(worker=None):
+                """Execute in EngineCore process to patch model runner"""
+                try:
+                    import logging
+                    logger = logging.getLogger(__name__)
+
+                    # Find model runner in engine process
+                    model_runner = None
+
+                    # Try to get from worker
+                    if worker is not None and hasattr(worker, 'model_runner'):
+                        model_runner = worker.model_runner
+                    else:
+                        # Fallback: search via gc
+                        try:
+                            from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+                            import gc
+
+                            for obj in gc.get_objects():
+                                if isinstance(obj, GPUModelRunner):
+                                    model_runner = obj
+                                    break
+                        except Exception:
+                            pass
+
+                    if model_runner is None:
+                        return {"success": False, "error": "Could not find model runner"}
+
+                    # Import and patch
+                    from vllm_attention_capture_plugin.wrappers.attention_layer_patcher import _patch_model_runner_execute
+                    _patch_model_runner_execute(model_runner)
+
+                    return {"success": True}
+
+                except Exception as e:
+                    import traceback
+                    return {
+                        "success": False,
+                        "error": str(e),
+                        "traceback": traceback.format_exc()
+                    }
+
+            result = llm.llm_engine.collective_rpc(_patch_model_runner_on_engine)
+
+            if isinstance(result, list):
+                result = result[0]
+
+            if not result.get("success"):
+                error = result.get("error", "Unknown error")
+                tb = result.get("traceback", "")
+                raise RuntimeError(f"{error}\n{tb}")
+
+            logger.info("✓ Successfully patched v1 model runner via RPC")
+            return
+
+        logger.warning("Could not patch model runner - unknown vLLM architecture")
+
+    except Exception as e:
+        logger.error(f"Failed to patch model runner: {e}")
+        logger.warning("Request ID tracking will fall back to session-level IDs")
+
+
+def _patch_model_runner_execute(model_runner: Any) -> None:
+    """Patch a model runner's execute_model to populate request ID mapping.
+
+    Args:
+        model_runner: The vLLM model runner instance (GPU or CPU)
+    """
+    if not hasattr(model_runner, 'execute_model'):
+        logger.warning("Model runner has no execute_model method, skipping patch")
+        return
+
+    original_execute = model_runner.execute_model
+
+    def execute_model_with_req_id_mapping(*args, **kwargs):
+        """Wrapped execute_model that extracts and stores request ID mapping"""
+
+        # Extract request IDs from SchedulerOutput
+        mapping = None
+        debug_phase = None
+
+        if args:
+            arg0 = args[0]
+
+            # Try 1: Direct req_ids attribute (v1 InputBatch - old API)
+            if hasattr(arg0, 'req_ids'):
+                mapping = {idx: req_id for idx, req_id in enumerate(arg0.req_ids)}
+                debug_phase = "InputBatch"
+
+            # Try 2: SchedulerOutput (v1 new API)
+            elif hasattr(arg0, 'scheduled_new_reqs') or hasattr(arg0, 'scheduled_cached_reqs'):
+                # Collect all request IDs from scheduled requests
+                req_ids = []
+
+                # New requests (list) - these appear during prefill
+                if hasattr(arg0, 'scheduled_new_reqs') and arg0.scheduled_new_reqs:
+                    debug_phase = "prefill"
+                    if isinstance(arg0.scheduled_new_reqs, list):
+                        for req in arg0.scheduled_new_reqs:
+                            if hasattr(req, 'req_id'):
+                                req_ids.append(req.req_id)
+                    elif hasattr(arg0.scheduled_new_reqs, 'req_id'):
+                        req_ids.append(arg0.scheduled_new_reqs, 'req_id')
+
+                # Cached requests (dict/list/object) - these appear during decode
+                if hasattr(arg0, 'scheduled_cached_reqs') and arg0.scheduled_cached_reqs is not None:
+                    if not debug_phase:
+                        debug_phase = "decode"
+
+                    # Check if it's a dict (req_id -> data mapping)
+                    if isinstance(arg0.scheduled_cached_reqs, dict):
+                        req_ids.extend(list(arg0.scheduled_cached_reqs.keys()))
+                    # Check if it's a list
+                    elif isinstance(arg0.scheduled_cached_reqs, list):
+                        for req in arg0.scheduled_cached_reqs:
+                            if hasattr(req, 'req_id'):
+                                req_ids.append(req.req_id)
+                            elif hasattr(req, 'req_ids'):  # CachedRequestData
+                                req_ids.extend(req.req_ids)
+                    # Single object
+                    elif hasattr(arg0.scheduled_cached_reqs, 'req_id'):
+                        req_ids.append(arg0.scheduled_cached_reqs.req_id)
+                    elif hasattr(arg0.scheduled_cached_reqs, 'req_ids'):  # CachedRequestData
+                        req_ids.extend(arg0.scheduled_cached_reqs.req_ids)
+
+                if req_ids:
+                    mapping = {idx: req_id for idx, req_id in enumerate(req_ids)}
+
+        if mapping and debug_phase == "prefill":
+            # Only log once per request during prefill
+            logger.info(f"✓ Mapped request IDs ({debug_phase}): {list(mapping.values())}")
+
+        if mapping:
+            _batch_req_id_mapping.set(mapping)
+        else:
+            # Clear mapping if we can't extract it
+            _batch_req_id_mapping.set(None)
+
+        # Call original execute_model
+        return original_execute(*args, **kwargs)
+
+    # Replace the method
+    model_runner.execute_model = execute_model_with_req_id_mapping
+    logger.info("✓ Patched model_runner.execute_model for request ID extraction")
+
+
+__all__ = [
+    "patch_attention_layer",
+    "patch_model_for_attention_capture",
+    "patch_model_runner",
+    "_user_request_id",
+    "_batch_req_id_mapping",
+    "_session_request_id",
+]

@@ -11,6 +11,7 @@ from typing import Any
 from vllm_attention_capture_plugin.hooks.attention_hook import AttentionCaptureHook
 from vllm_attention_capture_plugin.wrappers.attention_layer_patcher import (
     patch_model_for_attention_capture,
+    patch_model_runner,
     _user_request_id,  # Import the context variable
 )
 
@@ -23,7 +24,7 @@ _CAPTURE_HOOKS: dict[int, AttentionCaptureHook] = {}
 
 def enable_attention_capture(
     llm: Any,  # vllm.LLM
-    capture_layers: list[int] | int | None = None,
+    capture_layers: list[int] | None = None,
     attention_window: int | None = None,
     auto_clear: bool = True,
 ) -> None:
@@ -35,7 +36,7 @@ def enable_attention_capture(
     Args:
         llm: A vLLM LLM instance
         capture_layers: List of layer indices to capture (e.g., [0, 1, 2]).
-                       If None, captures first 3 layers. If -1, captures all layers.
+                       If None, captures all layers.
         attention_window: Number of recent tokens to capture attention for.
                          If None, captures full attention matrix (higher memory).
                          If set (e.g., 5), only captures last N positions (memory efficient).
@@ -67,7 +68,7 @@ def enable_attention_capture(
         # Generate text
         outputs = llm.generate("Hello world", SamplingParams(max_tokens=10))
 
-        # Access attention scores
+        # Access attention scores using vLLM's native request ID
         attention = get_attention_scores(outputs[0].request_id)
         ```
 
@@ -80,14 +81,21 @@ def enable_attention_capture(
         - Capture layers: +20-30% slower per layer
         - Non-capture layers: No overhead
         - Overall: <5-10% slowdown for typical config
+
+    Note on concurrent requests:
+        The plugin uses vLLM's native request IDs to track attention across prefill
+        and decode phases. For single-request generation (the typical use case), each
+        request gets a unique ID and attention is tracked correctly. For concurrent
+        requests in the same batch, attention is stored under the first request ID
+        due to batching limitations. Use sequential generation if per-request tracking
+        is critical for concurrent scenarios.
     """
+    # TODO think of a way to gracefully handle capture layers parameter. maybe change default. add feature to select last n layers
     if capture_layers is None:
-        capture_layers = [0, 1, 2]  # Default: first 3 layers
-    if type(capture_layers) is int:
-        if capture_layers == -1:
-            capture_layers = range(llm.model_config.get_num_layers()) # All layers
-        else:
-            capture_layers = [0, 1, 2]
+        # Get parallel config to determine number of layers
+        parallel_config = llm.llm_engine.vllm_config.parallel_config
+        num_layers = llm.model_config.get_num_layers(parallel_config)
+        capture_layers = list(range(num_layers))  # Default: all layers
 
     logger.info(
         "Enabling attention capture: layers=%s, window=%s, auto_clear=%s",
@@ -115,6 +123,8 @@ def enable_attention_capture(
                 model = llm.llm_engine.model_executor.driver_worker.model_runner.model
                 logger.info("Using v0 engine model path - direct access")
                 patch_model_for_attention_capture(model, hook)
+                # Patch model runner for request ID tracking (v0)
+                patch_model_runner(llm)
                 logger.info("✅ Attention capture enabled successfully (v0)")
                 return  # Success via v0
         except AttributeError:
@@ -216,6 +226,9 @@ def enable_attention_capture(
                     raise RuntimeError(f"{error}\n{tb}")
 
                 logger.info(f"✅ Attention capture enabled successfully (v1 via RPC) - model: {result.get('model_type')}")
+
+                # Patch model runner for request ID tracking (v1)
+                patch_model_runner(llm)
                 return  # Success via v1 RPC
 
             except Exception as e:
@@ -396,10 +409,31 @@ def get_latest_attention_scores() -> dict[int, Any] | None:
     # Get the most recently captured request from all hooks
     for hook in _CAPTURE_HOOKS.values():
         if hook.captured_scores:
-            # Return scores from the first available request
-            # For single-request scenarios, there should only be one
-            request_id = next(iter(hook.captured_scores))
-            return hook.get_captured_scores(request_id)
+            # Find the request with the most chunks (most complete)
+            # This handles the case where multiple request IDs exist due to timing issues
+            best_request_id = None
+            max_chunks = 0
+
+            for request_id, layers in hook.captured_scores.items():
+                # Count total chunks across all layers
+                total_chunks = sum(len(chunk_list) for chunk_list in layers.values())
+                if total_chunks > max_chunks:
+                    max_chunks = total_chunks
+                    best_request_id = request_id
+
+            if best_request_id is None:
+                return None
+
+            # DEBUG: Check what's in captured_scores before calling get_captured_scores
+            print(f"🔍 get_latest_attention_scores: Chose request_id={best_request_id} (had {max_chunks} total chunks)")
+            print(f"   All requests: {list(hook.captured_scores.keys())}")
+            print(f"   Layers in chosen request: {list(hook.captured_scores[best_request_id].keys())}")
+            for layer_idx, chunk_list in list(hook.captured_scores[best_request_id].items())[:3]:  # Show first 3 layers
+                print(f"   Layer {layer_idx}: {len(chunk_list)} chunks")
+                for i, chunk in enumerate(chunk_list[:3]):  # Show first 3 chunks
+                    print(f"      Chunk {i}: shape {chunk.shape}")
+
+            return hook.get_captured_scores(best_request_id)
 
     return None
 
