@@ -88,8 +88,11 @@ def compute_attention_with_capture(
             )
             attn_scores = attn_scores + causal_mask
 
-        # Softmax in float32, convert weights back to input dtype
-        attn_weights = F.softmax(attn_scores, dim=-1).to(query.dtype)
+        # Softmax in float32, keep in float32 for accurate capture
+        # DO NOT convert back to lower precision (bfloat16/float16) as it causes:
+        # 1. Row sums != 1.0 (precision loss in normalization)
+        # 2. Inaccurate attention values for analysis
+        attn_weights = F.softmax(attn_scores, dim=-1)
 
         return output, attn_weights
 
@@ -111,8 +114,11 @@ def compute_attention_with_capture(
                 attn_mask = attn_mask.float()
             attn_scores = attn_scores + attn_mask
 
-        # Softmax in float32, convert weights back to input dtype
-        attn_weights = F.softmax(attn_scores, dim=-1).to(query.dtype)
+        # Softmax in float32, keep in float32 for accurate capture
+        # DO NOT convert back to lower precision (bfloat16/float16) as it causes:
+        # 1. Row sums != 1.0 (precision loss in normalization)
+        # 2. Inaccurate attention values for analysis
+        attn_weights = F.softmax(attn_scores, dim=-1)
 
         # Apply attention to values using einsum
         output = torch.einsum("hqk,khd->qhd", attn_weights, value)

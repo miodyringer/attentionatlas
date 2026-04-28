@@ -4,7 +4,7 @@ os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"  # Required for Phase 2 plugi
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import uvicorn
 from dotenv import load_dotenv
 from vllm import LLM, SamplingParams
@@ -91,7 +91,8 @@ class GenerateRequest(BaseModel):
     prompt: str
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = 100
-    document_context: Optional[str] = None  # Separate field for document context
+    document_context: Optional[str] = None  # Deprecated - use documents instead
+    documents: Optional[List[Dict[str, str]]] = None  # [{"id": "doc1", "text": "..."}]
 
 
 class GenerateResponse(BaseModel):
@@ -120,6 +121,42 @@ def count_tokens(text: str, llm_instance: LLM) -> int:
     return len(tokens)
 
 
+def build_prompt(
+    user_question: str,
+    documents: List[Dict[str, str]] = None
+) -> str:
+    """
+    Build a structured prompt that instructs the model to use documents.
+
+    Args:
+        user_question: The user's question
+        documents: List of dicts with 'id' and 'text' keys
+
+    Returns:
+        Formatted prompt string
+    """
+    if not documents or len(documents) == 0:
+        # No documents - just return question
+        return user_question
+
+    # Build document section
+    doc_text = "\n\n".join([
+        f"Document {i+1} ({doc['id']}):\n{doc['text']}"
+        for i, doc in enumerate(documents)
+    ])
+
+    # Structured prompt with explicit instruction
+    prompt = f"""Answer the following question using ONLY information from the provided documents below. If the answer cannot be found in the documents, respond with "I cannot answer this based on the provided documents."
+
+{doc_text}
+
+Question: {user_question}
+
+Answer:"""
+
+    return prompt
+
+
 @app.get("/")
 async def root():
     return {"message": "LLM API is running (vLLM backend)"}
@@ -128,28 +165,84 @@ async def root():
 @app.post("/generate", response_model=GenerateResponse)
 async def generate_answer(request: GenerateRequest):
     try:
-        # Build full prompt with document context if provided
-        if request.document_context:
-            full_content = request.document_context + "\n\n" + request.prompt
-        else:
-            full_content = request.prompt
-
-        # Token boundary tracking
-        context_token_count = 0
-        prompt_token_count = 0
+        # Build full prompt with structured documents or legacy document_context
         token_boundaries = None
+        context_token_count = 0  # Initialize for backward compat metadata
+        prompt_token_count = 0  # Initialize for backward compat metadata
 
-        # Count tokens for boundaries
-        if request.document_context:
+        if request.documents:
+            # New structured documents approach
+            full_content = build_prompt(request.prompt, request.documents)
+
+            # Track each document's token boundaries
+            doc_boundaries = []
+            current_pos = 0
+
+            # Account for instruction text before documents
+            instruction_text = "Answer the following question using ONLY information from the provided documents below. If the answer cannot be found in the documents, respond with \"I cannot answer this based on the provided documents.\"\n\n"
+            current_pos = count_tokens(instruction_text, model)
+
+            for i, doc in enumerate(request.documents):
+                doc_header = f"Document {i+1} ({doc['id']}):\n"
+                header_tokens = count_tokens(doc_header, model)
+                doc_text_tokens = count_tokens(doc['text'], model)
+
+                doc_boundaries.append({
+                    "doc_id": doc['id'],
+                    "start": current_pos + header_tokens,
+                    "end": current_pos + header_tokens + doc_text_tokens
+                })
+
+                # Move position: header + doc_text + separator "\n\n"
+                current_pos += header_tokens + doc_text_tokens + count_tokens("\n\n", model)
+
+            # After all documents, track question position
+            question_prefix = "Question: "
+            question_start = current_pos + count_tokens(question_prefix, model)
+            question_tokens = count_tokens(request.prompt, model)
+            question_end = question_start + question_tokens
+
+            # After question, there's "\n\nAnswer:"
+            answer_prefix_tokens = count_tokens("\n\nAnswer:", model)
+
+            # For backward compat, set context_token_count to end of documents
+            context_token_count = current_pos
+            prompt_token_count = question_tokens
+
+            token_boundaries = {
+                "documents": doc_boundaries,
+                "question_start": question_start,
+                "question_end": question_end,
+                "has_template_tokens": True
+            }
+
+        elif request.document_context:
+            # Legacy document_context approach (backward compatibility)
+            full_content = request.document_context + "\n\n" + request.prompt
             context_token_count = count_tokens(request.document_context, model)
             prompt_token_count = count_tokens(request.prompt, model)
 
-            # For vLLM, we concatenate directly (no special template handling in this version)
             token_boundaries = {
                 "document_start": 0,
                 "document_end": context_token_count,
                 "prompt_start": context_token_count,
                 "prompt_end": context_token_count + prompt_token_count,
+                "has_template_tokens": False
+            }
+
+        else:
+            # No documents - just user question
+            full_content = request.prompt
+            prompt_token_count = count_tokens(request.prompt, model)
+            context_token_count = 0
+
+            token_boundaries = {
+                "document_start": 0,
+                "document_end": 0,
+                "prompt_start": 0,
+                "prompt_end": prompt_token_count,
+                "question_start": 0,
+                "question_end": prompt_token_count,
                 "has_template_tokens": False
             }
 
@@ -212,20 +305,21 @@ async def generate_answer(request: GenerateRequest):
         token_ids = tokenizer.encode(full_text_for_cache)
         token_strings = [tokenizer.decode([tid]) for tid in token_ids]
 
+        # Complete token boundaries with response positions
+        if token_boundaries is not None:
+            token_boundaries["response_start"] = prompt_length
+            token_boundaries["response_end"] = total_length
+
         # Store in cache with the full text as key
         attention_cache[full_text_for_cache] = {
             "scores": attention_scores,
             "tokens": token_strings,
             "num_tokens": len(token_strings),
-            "prefill_tokens": int(prompt_length)  # Store prefill count
+            "prefill_tokens": int(prompt_length),  # Store prefill count
+            "token_boundaries": token_boundaries  # Store boundaries for analysis
         }
 
         print(f"✅ Cached attention weights for {len(token_strings)} tokens")
-
-        # Complete token boundaries with response positions
-        if token_boundaries is not None:
-            token_boundaries["response_start"] = prompt_length
-            token_boundaries["response_end"] = total_length
 
         return GenerateResponse(
             answer=full_content + new_answer,  # Return full text like transformer_lens did
@@ -425,6 +519,331 @@ async def extract_pdf(file: UploadFile):
         return {"text": text, "pages": len(pdf_reader.pages)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF extraction failed: {str(e)}")
+
+
+# ========== NEW ENDPOINTS: Hallucination Detection & RAG Scoring ==========
+
+class HallucinationRequest(BaseModel):
+    answer: str  # Full text (context + prompt + response)
+    context_token_count: int  # How many tokens are context
+    attn_layer: Optional[int] = -1  # Which layer to use (-1 = last)
+    threshold: Optional[float] = 0.7
+
+
+class HallucinationResponse(BaseModel):
+    flagged_tokens: list  # Tokens above threshold
+    all_scores: list  # All hallucination scores
+    overall_confidence: float  # Overall answer confidence
+    has_hallucinations: bool
+
+
+@app.post("/detect_hallucination", response_model=HallucinationResponse)
+async def detect_hallucination_endpoint(request: HallucinationRequest):
+    """
+    Detect hallucinations in generated text using attention patterns.
+
+    Uses three signals:
+    1. Low attention to source tokens (not grounded in context)
+    2. High attention entropy (uncertainty)
+    3. Self-referential attention (attending only to recent tokens)
+    """
+    try:
+        from analysis.hallucination_detector import detect_hallucinations, get_flagged_tokens, compute_overall_confidence
+
+        # Look up cached attention
+        if request.answer not in attention_cache:
+            # Debug: print what's in cache vs what we're looking for
+            print(f"❌ Cache miss for text of length {len(request.answer)}")
+            print(f"   Looking for text starting with: {request.answer[:100]}")
+            print(f"   Cache has {len(attention_cache)} entries:")
+            for cache_key in list(attention_cache.keys())[:3]:  # Show first 3
+                print(f"   - Key length: {len(cache_key)}, starts with: {cache_key[:100]}")
+                print(f"     Tokens: {attention_cache[cache_key]['num_tokens']}")
+
+            raise HTTPException(
+                status_code=404,
+                detail="Attention data not found. Generate text first using /generate endpoint."
+            )
+
+        cached_data = attention_cache[request.answer]
+        attn_scores = cached_data["scores"]
+        tokens = cached_data["tokens"]
+
+        if not attn_scores:
+            raise HTTPException(status_code=500, detail="No attention scores in cache")
+
+        # Use last layer if -1, otherwise use specified layer
+        layer_idx = request.attn_layer if request.attn_layer >= 0 else max(attn_scores.keys())
+
+        if layer_idx not in attn_scores:
+            available_layers = sorted(attn_scores.keys())
+            raise HTTPException(
+                status_code=400,
+                detail=f"Layer {layer_idx} not found. Available layers: {available_layers}"
+            )
+
+        layer_attn = attn_scores[layer_idx]  # [num_heads, num_tokens, seq_len]
+
+        # Context is [0:context_token_count], rest is generated
+        source_range = (0, request.context_token_count)
+
+        # Run hallucination detection
+        scores = detect_hallucinations(
+            attn_weights=layer_attn,
+            tokens=tokens,
+            source_token_range=source_range,
+            layer_idx=layer_idx,
+            threshold=request.threshold
+        )
+
+        # Filter flagged tokens
+        flagged = get_flagged_tokens(scores, threshold=request.threshold)
+
+        # Overall confidence (average of all tokens)
+        overall_confidence = compute_overall_confidence(scores)
+
+        return HallucinationResponse(
+            flagged_tokens=[s.to_dict() for s in flagged],
+            all_scores=[s.to_dict() for s in scores],
+            overall_confidence=overall_confidence,
+            has_hallucinations=len(flagged) > 0
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"Error in detect_hallucination: {e}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class RAGScoreRequest(BaseModel):
+    answer: str
+    document_boundaries: list  # [{"start": int, "end": int, "doc_id": str}]
+    generation_start: int  # Token index where generation begins
+
+
+class RAGScoreResponse(BaseModel):
+    document_scores: list  # Scored documents
+    most_relevant_doc: str  # ID of most relevant document
+    unused_docs: list  # IDs of ignored documents
+
+
+@app.post("/score_rag_documents", response_model=RAGScoreResponse)
+async def score_rag_endpoint(request: RAGScoreRequest):
+    """
+    Score RAG documents by attention attribution.
+
+    Measures which retrieved documents the model actually uses during generation.
+    """
+    try:
+        from analysis.rag_scorer import score_rag_documents, get_most_relevant_document, get_unused_documents
+
+        # Look up cached attention
+        if request.answer not in attention_cache:
+            raise HTTPException(
+                status_code=404,
+                detail="Attention data not found. Generate text first using /generate endpoint."
+            )
+
+        cached_data = attention_cache[request.answer]
+        attn_scores = cached_data["scores"]
+        tokens = cached_data["tokens"]
+
+        if not attn_scores:
+            raise HTTPException(status_code=500, detail="No attention scores in cache")
+
+        # Use last layer for attribution
+        layer_idx = max(attn_scores.keys())
+        layer_attn = attn_scores[layer_idx]  # [num_heads, num_tokens, seq_len]
+
+        # Convert document boundaries from dict format to tuple format
+        doc_ranges = [
+            (d["start"], d["end"], d["doc_id"])
+            for d in request.document_boundaries
+        ]
+
+        # Run RAG scoring
+        doc_scores = score_rag_documents(
+            attn_weights=layer_attn,
+            tokens=tokens,
+            document_ranges=doc_ranges,
+            generation_start=request.generation_start
+        )
+
+        # Get most relevant and unused documents
+        most_relevant = get_most_relevant_document(doc_scores)
+        unused = get_unused_documents(doc_scores)
+
+        return RAGScoreResponse(
+            document_scores=[d.to_dict() for d in doc_scores],
+            most_relevant_doc=most_relevant.doc_id if most_relevant else "",
+            unused_docs=[d.doc_id for d in unused]
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"Error in score_rag_documents: {e}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def aggregate_attention_layers(
+    layer_scores: Dict[int, np.ndarray],
+    mode: str
+) -> np.ndarray:
+    """
+    Aggregate attention across layers.
+
+    Args:
+        layer_scores: Dict mapping layer_idx -> attention array
+        mode: "last", "last_3", "last_5", "all", or specific int like "5"
+
+    Returns:
+        Aggregated attention: [num_heads, num_tokens, seq_len]
+    """
+    layer_indices = sorted(layer_scores.keys())
+
+    if mode == "last":
+        return layer_scores[layer_indices[-1]]
+
+    elif mode.startswith("last_"):
+        n = int(mode.split("_")[1])
+        selected_layers = layer_indices[-n:]
+        # Weighted average: later layers get more weight
+        weights = np.array([0.1, 0.2, 0.3, 0.4])[-n:]  # Last is 0.4
+        weights = weights / weights.sum()  # Normalize
+
+        aggregated = None
+        for i, layer_idx in enumerate(selected_layers):
+            layer_attn = layer_scores[layer_idx]
+            if aggregated is None:
+                aggregated = layer_attn * weights[i]
+            else:
+                aggregated += layer_attn * weights[i]
+        return aggregated
+
+    elif mode == "all":
+        # Simple average
+        aggregated = None
+        for layer_attn in layer_scores.values():
+            if aggregated is None:
+                aggregated = layer_attn.copy()
+            else:
+                aggregated += layer_attn
+        return aggregated / len(layer_scores)
+
+    else:
+        # Specific layer by index
+        layer_idx = int(mode)
+        if layer_idx not in layer_scores:
+            raise ValueError(f"Layer {layer_idx} not in cache")
+        return layer_scores[layer_idx]
+
+
+class AnswerGroundingRequest(BaseModel):
+    answer: str  # Full text
+    layer_mode: str = "last"  # "last", "last_3", "last_5", "all", or specific int
+
+
+class AnswerGroundingResponse(BaseModel):
+    per_token: List[dict]
+    document_usage: Dict[str, float]
+    avg_document_attention: float
+    avg_question_attention: float
+    avg_self_attention: float
+    well_grounded: bool
+    hallucination_risk: float
+    unused_documents: List[str]
+
+
+@app.post("/analyze_answer_grounding", response_model=AnswerGroundingResponse)
+async def analyze_answer_grounding_endpoint(request: AnswerGroundingRequest):
+    """
+    Analyze how the generated answer is grounded in documents, question, and itself.
+
+    This endpoint provides comprehensive analysis of token-level attribution:
+    - Which documents were used
+    - How much the answer relies on the question vs self-reference
+    - Per-token grounding details
+    """
+    try:
+        from analysis.answer_grounding import analyze_answer_grounding
+
+        # Look up cached attention and metadata
+        if request.answer not in attention_cache:
+            raise HTTPException(
+                status_code=404,
+                detail="Attention data not found. Generate text first using /generate endpoint."
+            )
+
+        cached_data = attention_cache[request.answer]
+        attn_scores = cached_data["scores"]  # Dict[layer_idx, ndarray]
+        tokens = cached_data["tokens"]
+        token_boundaries = cached_data.get("token_boundaries")
+
+        if not token_boundaries:
+            raise HTTPException(
+                status_code=400,
+                detail="No token boundaries in cache. Make sure to use structured documents in /generate."
+            )
+
+        # Extract regions
+        document_ranges = [
+            (d["start"], d["end"], d["doc_id"])
+            for d in token_boundaries.get("documents", [])
+        ]
+
+        question_range = (
+            token_boundaries.get("question_start", 0),
+            token_boundaries.get("question_end", 0)
+        )
+
+        answer_range = (
+            token_boundaries.get("response_start"),
+            token_boundaries.get("response_end")
+        )
+
+        # Validate ranges
+        if answer_range[0] is None or answer_range[1] is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid answer range in token boundaries"
+            )
+
+        # Aggregate layers based on mode
+        attn_weights = aggregate_attention_layers(
+            attn_scores,
+            mode=request.layer_mode
+        )
+
+        # Run analysis
+        report = analyze_answer_grounding(
+            attn_weights=attn_weights,
+            tokens=tokens,
+            document_ranges=document_ranges,
+            question_range=question_range,
+            answer_range=answer_range
+        )
+
+        return AnswerGroundingResponse(
+            per_token=[t.to_dict() for t in report.per_token],
+            document_usage=report.document_usage,
+            avg_document_attention=report.avg_document_attention,
+            avg_question_attention=report.avg_question_attention,
+            avg_self_attention=report.avg_self_attention,
+            well_grounded=report.well_grounded,
+            hallucination_risk=report.hallucination_risk,
+            unused_documents=report.unused_documents
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"Error in analyze_answer_grounding: {e}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

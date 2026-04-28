@@ -331,9 +331,10 @@ def patch_attention_layer(
                 # PREFILL PHASE: All tokens in prompt
                 # ============================================================
                 # Reshape Q, K, V: [num_tokens, num_heads * head_size] -> [num_tokens, num_heads, head_size]
-                q = query.view(num_tokens, num_heads, head_size)
-                k = key.view(num_tokens, num_kv_heads, head_size)
-                v = value.view(num_tokens, num_kv_heads, head_size)
+                # CONVERT TO FLOAT32 immediately to ensure accurate attention computation
+                q = query.view(num_tokens, num_heads, head_size).float()
+                k = key.view(num_tokens, num_kv_heads, head_size).float()
+                v = value.view(num_tokens, num_kv_heads, head_size).float()
 
                 # Handle GQA: repeat KV heads to match Q heads
                 if num_kv_heads < num_heads:
@@ -346,13 +347,15 @@ def patch_attention_layer(
                 q_transposed = q.transpose(0, 1)  # [num_heads, num_tokens, head_size]
 
                 # Compute attention scores: Q @ K^T * scale
+                # Already in float32, so computation is accurate
                 scores = torch.bmm(q_transposed, k_t) * scale
 
                 # Apply causal mask
                 causal_mask = torch.triu(torch.ones(num_tokens, num_tokens, device=scores.device), diagonal=1).bool()
                 scores = scores.masked_fill(causal_mask.unsqueeze(0), float('-inf'))
 
-                # Apply softmax to get attention weights
+                # Apply softmax to get attention weights (already in float32)
+                # CRITICAL: Keep in float32 to ensure row sums = 1.0
                 attn_weights = torch.softmax(scores, dim=-1)
 
             else:
@@ -376,12 +379,14 @@ def patch_attention_layer(
 
                 # Concatenate all accumulated keys and values for this request
                 # This includes all prefill tokens + all previously generated decode tokens
-                all_keys = torch.cat(accumulator['keys'], dim=0)
-                all_values = torch.cat(accumulator['values'], dim=0)
+                # CONVERT TO FLOAT32 for accurate computation
+                all_keys = torch.cat(accumulator['keys'], dim=0).float()
+                all_values = torch.cat(accumulator['values'], dim=0).float()
                 context_len = all_keys.shape[0]
 
                 # Reshape query: [1, num_heads * head_size] -> [1, num_heads, head_size]
-                q = query.view(1, num_heads, head_size)
+                # CONVERT TO FLOAT32
+                q = query.view(1, num_heads, head_size).float()
 
                 # Handle GQA: expand KV heads to match Q heads
                 if num_heads != num_kv_heads:
@@ -403,12 +408,14 @@ def patch_attention_layer(
                 # Compute attention scores: Q @ K^T
                 # [num_heads, 1, head_size] @ [num_heads, head_size, context_len]
                 # -> [num_heads, 1, context_len]
+                # Already in float32, so computation is accurate
                 attn_scores = torch.matmul(q_t, k_t.transpose(-2, -1))
 
                 # Scale
                 attn_scores = attn_scores * scale
 
-                # Softmax to get attention weights
+                # Softmax to get attention weights (already in float32)
+                # CRITICAL: Keep in float32 to ensure row sums = 1.0
                 # Shape: [num_heads, 1, context_len] where context_len includes ALL tokens (prefill + previous decodes + current)
                 attn_weights = torch.softmax(attn_scores, dim=-1)
 
